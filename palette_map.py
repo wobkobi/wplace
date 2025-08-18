@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-palette_map_dual.py  — stricter uniqueness
+palette_map_dual.py  — pixel/photo modes with lightness guards
 
 Modes:
 - pixel : Global OKLab/OKLCh distance + matching for top colours, then greedy with
-          stricter no-reuse policy for the rest.
+          stricter no-reuse, grey/near-white/brown guards, and lightness guards
+          to stop light blues drifting to deep blues.
 - photo : Classic OKLab nearest with mild anti-grey bias.
 
-Alpha preserved. No upscaling.
+Alpha preserved. No upscaling on resize. Output defaults to "<input_stem>_wplace.png".
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import argparse
 import numpy as np
 from PIL import Image
 
-# ---------- Palette ----------
+# ---------- Single source of truth: (hex, name, tier) ----------
 PALETTE_ENTRIES: tuple[tuple[str, str, str], ...] = (
     # Free
     ("#000000", "Black", "Free"),
@@ -85,12 +86,14 @@ PALETTE_ENTRIES: tuple[tuple[str, str, str], ...] = (
     ("#6d758d", "Slate", "Premium"),
     ("#b3b9d1", "Light Slate", "Premium"),
 )
+
+# Derived views
 PALETTE_HEX: tuple[str, ...] = tuple(h for h, _, _ in PALETTE_ENTRIES)
 HEX_TO_NAME: Dict[str, str] = {h.lower(): n for h, n, _ in PALETTE_ENTRIES}
 HEX_TO_TIER: Dict[str, str] = {h.lower(): t for h, _, t in PALETTE_ENTRIES}
 
 
-# ---------- Utils ----------
+# ---------------- Utils ----------------
 def parse_hex(code: str) -> Tuple[int, int, int]:
     s = code[1:] if code.startswith("#") else code
     return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
@@ -130,10 +133,14 @@ def _srgb_to_oklab(rgb_u8: np.ndarray) -> np.ndarray:
     return np.stack([L, A, B], axis=-1).astype(np.float32)
 
 
-# ===== Photo mode (nearest with mild anti-grey) =====
-PHOTO_SRC_SAT_T = 0.06
-PHOTO_PAL_GREY_T = 0.03
-PHOTO_GREY_PENALTY = 1.7
+def _wrap(a: np.ndarray) -> np.ndarray:
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+# ======== PHOTO MODE (classic nearest with chroma-aware anti-grey) ========
+PHOTO_SRC_SAT_T: float = 0.06  # source considered saturated if chroma > this
+PHOTO_PAL_GREY_T: float = 0.03  # palette considered grey if chroma < this
+PHOTO_GREY_PENALTY: float = 1.7  # penalise mapping saturated colours to greys
 
 
 def _nearest_indices_oklab_photo(
@@ -153,48 +160,72 @@ def _nearest_indices_oklab_photo(
 
 
 def palette_map_array_photo(rgb_flat: np.ndarray, palette: np.ndarray) -> np.ndarray:
-    unique_rgb, inv = np.unique(rgb_flat, axis=0, return_inverse=True)
+    unique_rgb, inverse = np.unique(rgb_flat, axis=0, return_inverse=True)
     pal_lab = _srgb_to_oklab(palette)
-    pal_C = np.hypot(pal_lab[:, 1], pal_lab[:, 2])
+    pal_chroma = np.hypot(pal_lab[:, 1], pal_lab[:, 2])
     src_lab = _srgb_to_oklab(unique_rgb)
-    src_C = np.hypot(src_lab[:, 1], src_lab[:, 2])
-    idx = _nearest_indices_oklab_photo(src_lab, pal_lab, src_C, pal_C)
-    return palette[idx][inv].astype(np.uint8)
+    src_chroma = np.hypot(src_lab[:, 1], src_lab[:, 2])
+    idx = _nearest_indices_oklab_photo(src_lab, pal_lab, src_chroma, pal_chroma)
+    return palette[idx][inverse].astype(np.uint8)
 
 
-# ===== Pixel mode (global matching + stricter no-reuse) =====
+# ======== PIXEL MODE (global distance + matching + guards) ========
+# Base weights
 HUE_WEIGHT_BASE = 0.45
 CHROMA_FLOOR = 0.02
 CHROMA_RANGE = 0.12
+
+# Anti-grey for saturated sources
 SRC_SAT_T = 0.04
 PAL_GREY_T = 0.05
 GREY_PENALTY = 2.0
+
+# Near-white guard
 WHITE_L_T = 0.92
 WHITE_PENALTY = 3.0
 
-GOOD_ENOUGH_RATIO = 1.05  # stricter candidate sets
-MAX_CANDIDATES = 20
-SHARE_GUARD_RATIO = 1.10  # if best is owned by a top colour, need alt within 10%
-STRICT_REUSE_RATIO = 1.12  # avoid reusing any already-used slot if free alt within 12%
+# Brown guard (greys drifting warm)
+BROWN_HUE_C = np.deg2rad(35.0)  # centre around orange
+BROWN_HUE_BW = np.deg2rad(35.0)  # half-width
+BROWN_CHROMA_MIN = 0.06
+BROWN_PENALTY = 4.0  # more punishing
 
+# Slate is treated grey-like to help neutral ladders
+# We infer "grey-like" from low chroma across the palette.
 
-def _wrap(a: np.ndarray) -> np.ndarray:
-    return (a + np.pi) % (2 * np.pi) - np.pi
+# Lightness guards to keep light colours from falling to deep choices
+LIGHT_DROP_L_T = 0.06
+LIGHT_SRC_T = 0.70
+HUE_CLOSE_T = np.deg2rad(28.0)
+CLOSE_CHROMA_T = 0.05
+LIGHT_DROP_PEN = 7.0
+
+LIGHT_SOFT_W = 0.25
+LIGHT_SOFT_SRC = 0.60
+LIGHT_SOFT_SPAN = 0.35
+
+# Candidate & sharing controls
+GOOD_ENOUGH_RATIO = 1.06
+MAX_CANDIDATES = 24
+SHARE_GUARD_RATIO = 1.08
+STRICT_REUSE_RATIO = 1.10
 
 
 def compute_d2(src_rgb: np.ndarray, pal_rgb: np.ndarray) -> np.ndarray:
     pal = _srgb_to_oklab(pal_rgb)
     src = _srgb_to_oklab(src_rgb)
-    pal_L, pal_C, pal_h = (
-        pal[:, 0],
-        np.hypot(pal[:, 1], pal[:, 2]),
-        np.arctan2(pal[:, 2], pal[:, 1]),
-    )
-    src_L, src_C, src_h = (
-        src[:, 0],
-        np.hypot(src[:, 1], src[:, 2]),
-        np.arctan2(src[:, 2], src[:, 1]),
-    )
+
+    pal_L = pal[:, 0]
+    pal_A = pal[:, 1]
+    pal_B = pal[:, 2]
+    pal_C = np.hypot(pal_A, pal_B)
+    pal_h = np.arctan2(pal_B, pal_A)
+
+    src_L = src[:, 0]
+    src_A = src[:, 1]
+    src_B = src[:, 2]
+    src_C = np.hypot(src_A, src_B)
+    src_h = np.arctan2(src_B, src_A)
 
     dL2 = (src_L[:, None] - pal_L[None, :]) ** 2
     dC2 = (src_C[:, None] - pal_C[None, :]) ** 2
@@ -203,11 +234,16 @@ def compute_d2(src_rgb: np.ndarray, pal_rgb: np.ndarray) -> np.ndarray:
         HUE_WEIGHT_BASE
         * np.clip((src_C - CHROMA_FLOOR) / CHROMA_RANGE, 0.0, 1.0)[:, None]
     )
-    d2 = 0.6 * dL2 + 1.0 * dC2 + hue_w * (dh**2)
 
+    # Base distance with higher L weight
+    d2 = 0.8 * dL2 + 1.0 * dC2 + hue_w * (dh**2)
+
+    # Anti-grey for saturated sources
     pen_grey = (src_C[:, None] > SRC_SAT_T) & (pal_C[None, :] < PAL_GREY_T)
     if pen_grey.any():
         d2 = np.where(pen_grey, d2 * (GREY_PENALTY**2), d2)
+
+    # Near-white guard (block chromatic -> white)
     pen_white = (
         (src_C[:, None] > 0.04)
         & (pal_C[None, :] < PAL_GREY_T)
@@ -215,6 +251,37 @@ def compute_d2(src_rgb: np.ndarray, pal_rgb: np.ndarray) -> np.ndarray:
     )
     if pen_white.any():
         d2 = np.where(pen_white, d2 * (WHITE_PENALTY**2), d2)
+
+    # Brown guard (pull neutrals away from warm browns)
+    # Apply when palette hue near ~35°, palette chroma is at least modest,
+    # and source is neutral-ish.
+    brown_band = (np.abs(_wrap(pal_h - BROWN_HUE_C)) <= BROWN_HUE_BW) & (
+        pal_C >= BROWN_CHROMA_MIN
+    )
+    if np.any(brown_band):
+        neutral_src = src_C < 0.06
+        if np.any(neutral_src):
+            mask = neutral_src[:, None] & brown_band[None, :]
+            d2 = np.where(mask, d2 * (BROWN_PENALTY**2), d2)
+
+    # Lightness soft bias: for light sources, prefer not to go darker if otherwise similar
+    soft_w = np.clip((src_L - LIGHT_SOFT_SRC) / max(LIGHT_SOFT_SPAN, 1e-6), 0.0, 1.0)[
+        :, None
+    ]
+    delta_L_neg = np.clip(
+        src_L[:, None] - pal_L[None, :], 0.0, 1.0
+    )  # only penalise darker targets
+    d2 = d2 + LIGHT_SOFT_W * (soft_w * (delta_L_neg**2))
+
+    # Hard light->deep guard within same hue/chroma family
+    light_src = src_L > LIGHT_SRC_T
+    too_dark = pal_L[None, :] < (src_L[:, None] - LIGHT_DROP_L_T)
+    hue_close = np.abs(_wrap(src_h[:, None] - pal_h[None, :])) <= HUE_CLOSE_T
+    chroma_close = np.abs(src_C[:, None] - pal_C[None, :]) <= CLOSE_CHROMA_T
+    forbid_mask = light_src[:, None] & too_dark & hue_close & chroma_close
+    if np.any(forbid_mask):
+        d2 = np.where(forbid_mask, d2 * (LIGHT_DROP_PEN**2), d2)
+
     return d2
 
 
@@ -284,14 +351,15 @@ def map_visible_pixels_global(
         cj = int(chosen[ii])
         if cj != -1:
             choice[ii] = cj
+            used.add(cj)
 
-    # Greedy for remaining with stricter no-reuse
+    # Greedy for remaining with stricter no-reuse and “good enough” guards
     for i_val in order_src:
         ii = int(i_val)
-        if choice[ii] != -1:  # already set by matching
+        if choice[ii] != -1:
             continue
 
-        row = cands[ii]  # cands is a List[np.ndarray]
+        row = cands[ii]
         if row.size == 0:
             row = np.argsort(d2[ii])[:1]
 
@@ -332,92 +400,113 @@ def map_visible_pixels_global(
     return palette[choice][inv].astype(np.uint8)
 
 
-# ---------- Shared ----------
+# ------------- Shared helpers -------------
 def scale_to_height(img: Image.Image, target_h: int) -> Image.Image:
     if target_h <= 0:
         return img
     w, h = img.width, img.height
-    if target_h >= h:
+    if target_h >= h:  # no upscaling
         return img
-    nw = max(1, round(w * target_h / h))
-    return img.resize((nw, target_h), resample=Image.Resampling.BOX)
+    new_w = max(1, round(w * target_h / h))
+    return img.resize((new_w, target_h), resample=Image.Resampling.BOX)
 
 
 def report_usage(img: Image.Image) -> None:
+    """Print colours used with names and tiers (no hex), sorted by count desc."""
     arr = np.array(img, dtype=np.uint8)
     if img.mode == "RGBA":
-        m = arr[:, :, 3] > 0
-        if not m.any():
+        mask = arr[:, :, 3] > 0
+        if not mask.any():
             print("Colours used: none (fully transparent)")
             return
-        cols = arr[:, :, :3][m].reshape(-1, 3)
+        cols = arr[:, :, :3][mask].reshape(-1, 3)
     else:
         cols = arr.reshape(-1, 3)
-    uniq, cnt = np.unique(cols, axis=0, return_counts=True)
 
-    def _hx(r: np.ndarray) -> str:
-        return f"#{int(r[0]):02x}{int(r[1]):02x}{int(r[2]):02x}"
+    uniq, counts = np.unique(cols, axis=0, return_counts=True)
 
-    items = []
-    for c, n in zip(uniq, cnt):
-        h = _hx(c).lower()
-        items.append((n, HEX_TO_NAME.get(h, "Unknown"), HEX_TO_TIER.get(h, "Premium")))
+    def _rgb_to_hex(row: np.ndarray) -> str:
+        return f"#{int(row[0]):02x}{int(row[1]):02x}{int(row[2]):02x}"
+
+    items: List[tuple[int, str, str]] = []
+    for rgbv, cnt in zip(uniq, counts):
+        hx = _rgb_to_hex(rgbv).lower()
+        name = HEX_TO_NAME.get(hx, "Unknown")
+        tier = HEX_TO_TIER.get(hx, "Premium")
+        items.append((cnt, name, tier))
     items.sort(key=lambda t: t[0], reverse=True)
+
     print("Colours used:")
-    for n, name, tier in items:
-        print(f"{name} [{tier}]: {n}")
+    for cnt, name, tier in items:
+        print(f"{name} [{tier}]: {cnt}")
 
 
-# ---------- Pipeline ----------
+# ------------- Pipeline -------------
 def process(
-    input_path: str,
-    output_path: str,
-    target_height: int,
-    mode: str,
-    auto_threshold: int,
+    input_path: str, output_path: str | None, target_height: int, mode: str
 ) -> None:
     palette = build_palette()
-    im = Image.open(input_path).convert("RGBA")
-    im = scale_to_height(im, target_height)
-    arr = np.array(im, dtype=np.uint8)
+
+    im_in = Image.open(input_path)
+    im_rgba = im_in.convert("RGBA")  # preserve transparency for P/tRNS images
+    im_small = scale_to_height(im_rgba, target_height)
+
+    arr = np.array(im_small, dtype=np.uint8)
     h, w = arr.shape[:2]
+
     rgb = arr[:, :, :3].reshape(-1, 3)
     a = arr[:, :, 3].reshape(-1)
-    vis = a > 0
+    vis_mask = a > 0
 
-    chosen = mode
+    # Mode selection
+    chosen_mode = mode
     if mode == "auto":
-        uniq_vis = np.unique(rgb[vis], axis=0).shape[0] if vis.any() else 0
-        chosen = "photo" if uniq_vis > auto_threshold else "pixel"
+        # Heuristic: many unique colours → photo; otherwise pixel
+        uniq_vis = np.unique(rgb[vis_mask], axis=0).shape[0] if vis_mask.any() else 0
+        chosen_mode = "photo" if uniq_vis > 4096 else "pixel"
 
+    # Map
     rgb_out = rgb.copy()
-    if vis.any():
-        mapped = (
-            map_visible_pixels_global(rgb[vis], palette)
-            if chosen == "pixel"
-            else palette_map_array_photo(rgb[vis], palette)
-        )
-        rgb_out[vis] = mapped
+    if vis_mask.any():
+        if chosen_mode == "pixel":
+            mapped = map_visible_pixels_global(rgb[vis_mask], palette)
+        else:
+            mapped = palette_map_array_photo(rgb[vis_mask], palette)
+        rgb_out[vis_mask] = mapped
 
     out = np.dstack([rgb_out.reshape(h, w, 3), a.reshape(h, w)]).astype(np.uint8)
-    Image.fromarray(out).save(output_path, format="PNG", optimize=False)
-    print(f"Mode: {chosen}")
-    print(f"Wrote {output_path} | size={w}x{h} | palette_size={len(PALETTE_ENTRIES)}\n")
-    report_usage(Image.fromarray(out))
+    out_img = Image.fromarray(out)
+
+    # Output path
+    if output_path is None or output_path == "":
+        out_path = Path(input_path).with_name(f"{Path(input_path).stem}_wplace.png")
+    else:
+        out_path = Path(output_path)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_img.save(out_path, format="PNG", optimize=False)
+    print(f"Mode: {chosen_mode}")
+    print(f"Wrote {out_path} | size={w}x{h} | palette_size={len(PALETTE_ENTRIES)}\n")
+    report_usage(out_img)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Dual-mode palette mapper with stricter uniqueness."
+        description="Dual-mode palette mapper with lightness guards and strict global uniqueness."
     )
     ap.add_argument("input", type=str)
-    ap.add_argument("output", type=str)
-    ap.add_argument("--height", type=int, default=512)
+    ap.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output PNG path; default '<input_stem>_wplace.png'",
+    )
+    ap.add_argument(
+        "--height", type=int, default=512, help="Output height (downsize only)"
+    )
     ap.add_argument("--mode", choices=["auto", "pixel", "photo"], default="auto")
-    ap.add_argument("--auto-threshold", type=int, default=4096)
     args = ap.parse_args()
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    process(args.input, args.output, args.height, args.mode, args.auto_threshold)
+    process(args.input, args.output, args.height, args.mode)
 
 
 if __name__ == "__main__":
