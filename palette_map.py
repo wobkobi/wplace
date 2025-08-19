@@ -1,116 +1,106 @@
 #!/usr/bin/env python3
 """
-palette_map_dual.py  — pixel/photo modes with lightness + neutrality guards
+palette_map_dual.py — closest-first + frequency-conflict + neighbour tone-pairing
+(with soft, general guardrails; no hard-coded colour exceptions)
 
-Modes
------
-- pixel : Global OKLab/OKLCh distance with:
-          - stronger anti-brown for neutrals,
-          - near-white clamp (prevents "light cyan as white"),
-          - lightness guards (stops light colours falling to deep ones),
-          - gentle green->olive preference over "stone/grey" for genuinely green sources,
-          - global top-colour matching + greedy fill with strict re-use rules.
-- photo : Classic OKLab nearest with a mild anti-grey bias for saturated sources.
+- pixel: OKLab/OKLCh cost with generic constraints, frequency-first assignment
+         with peer awareness, neighbour separation, gradient sign preservation.
+- photo: OKLab nearest with a mild "don't collapse vivid colours to grey" bias.
 
-Notes
------
-- Alpha is preserved.
-- Downsize only (no upscaling) if --height is provided.
-- Output defaults to "<input_stem>_wplace.png".
+Alpha preserved. No upscaling.
+Default output "<input_stem>_wplace.png".
+Prints palette usage (hex, name, count).
+
+Examples
+  python palette_map_dual.py input.png
+  python palette_map_dual.py input.png --mode pixel --height 512
+  python palette_map_dual.py input.png --mode photo
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Set
 import argparse
 import numpy as np
 from PIL import Image
 
-
-# ---------- Single source of truth: (hex, name, tier) ----------
-PALETTE_ENTRIES: tuple[tuple[str, str, str], ...] = (
-    # Free
-    ("#000000", "Black", "Free"),
-    ("#3c3c3c", "Dark Gray", "Free"),
-    ("#787878", "Gray", "Free"),
-    ("#d2d2d2", "Light Gray", "Free"),
-    ("#ffffff", "White", "Free"),
-    ("#600018", "Deep Red", "Free"),
-    ("#ed1c24", "Red", "Free"),
-    ("#ff7f27", "Orange", "Free"),
-    ("#f6aa09", "Gold", "Free"),
-    ("#f9dd3b", "Yellow", "Free"),
-    ("#fffabc", "Light Yellow", "Free"),
-    ("#0eb968", "Dark Green", "Free"),
-    ("#13e67b", "Green", "Free"),
-    ("#87ff5e", "Light Green", "Free"),
-    ("#0c816e", "Dark Teal", "Free"),
-    ("#10aea6", "Teal", "Free"),
-    ("#13e1be", "Light Teal", "Free"),
-    ("#28509e", "Dark Blue", "Free"),
-    ("#4093e4", "Blue", "Free"),
-    ("#60f7f2", "Cyan", "Free"),
-    ("#6b50f6", "Indigo", "Free"),
-    ("#99b1fb", "Light Indigo", "Free"),
-    ("#780c99", "Dark Purple", "Free"),
-    ("#aa38b9", "Purple", "Free"),
-    ("#e09ff9", "Light Purple", "Free"),
-    ("#cb007a", "Dark Pink", "Free"),
-    ("#ec1f80", "Pink", "Free"),
-    ("#f38da9", "Light Pink", "Free"),
-    ("#684634", "Dark Brown", "Free"),
-    ("#95682a", "Brown", "Free"),
-    ("#f8b277", "Beige", "Free"),
-    # Premium
-    ("#aaaaaa", "Medium Gray", "Premium"),
-    ("#a50e1e", "Dark Red", "Premium"),
-    ("#fa8072", "Light Red", "Premium"),
-    ("#e45c1a", "Dark Orange", "Premium"),
-    ("#9c8431", "Dark Goldenrod", "Premium"),
-    ("#c5ad31", "Goldenrod", "Premium"),
-    ("#e8d45f", "Light Goldenrod", "Premium"),
-    ("#4a6b3a", "Dark Olive", "Premium"),
-    ("#5a944a", "Olive", "Premium"),
-    ("#84c573", "Light Olive", "Premium"),
-    ("#0f799f", "Dark Cyan", "Premium"),
-    ("#bbfaf2", "Light Cyan", "Premium"),
-    ("#7dc7ff", "Light Blue", "Premium"),
-    ("#4d31b8", "Dark Indigo", "Premium"),
-    ("#4a4284", "Dark Slate Blue", "Premium"),
-    ("#7a71c4", "Slate Blue", "Premium"),
-    ("#b5aef1", "Light Slate Blue", "Premium"),
-    ("#9b5249", "Dark Peach", "Premium"),
-    ("#d18078", "Peach", "Premium"),
-    ("#fab6a4", "Light Peach", "Premium"),
-    ("#dba463", "Light Brown", "Premium"),
-    ("#7b6352", "Dark Tan", "Premium"),
-    ("#9c846b", "Tan", "Premium"),
-    ("#d6b594", "Light Tan", "Premium"),
-    ("#d18051", "Dark Beige", "Premium"),
-    ("#ffc5a5", "Light Beige", "Premium"),
-    ("#6d643f", "Dark Stone", "Premium"),
-    ("#948c6b", "Stone", "Premium"),
-    ("#cdc59e", "Light Stone", "Premium"),
-    ("#333941", "Dark Slate", "Premium"),
-    ("#6d758d", "Slate", "Premium"),
-    ("#b3b9d1", "Light Slate", "Premium"),
+# ---------- Palette (wheel → greyscale) ----------
+PALETTE_ENTRIES: tuple[tuple[str, str], ...] = (
+    ("#ed1c24", "Red"),
+    ("#d18078", "Peach"),
+    ("#fa8072", "Light Red"),
+    ("#9b5249", "Dark Peach"),
+    ("#fab6a4", "Light Peach"),
+    ("#e45c1a", "Dark Orange"),
+    ("#684634", "Dark Brown"),
+    ("#ffc5a5", "Light Beige"),
+    ("#d18051", "Dark Beige"),
+    ("#ff7f27", "Orange"),
+    ("#7b6352", "Dark Tan"),
+    ("#f8b277", "Beige"),
+    ("#d6b594", "Light Tan"),
+    ("#9c846b", "Tan"),
+    ("#dba463", "Light Brown"),
+    ("#95682a", "Brown"),
+    ("#f6aa09", "Gold"),
+    ("#9c8431", "Dark Goldenrod"),
+    ("#6d643f", "Dark Stone"),
+    ("#948c6b", "Stone"),
+    ("#cdc59e", "Light Stone"),
+    ("#c5ad31", "Goldenrod"),
+    ("#f9dd3b", "Yellow"),
+    ("#e8d45f", "Light Goldenrod"),
+    ("#fffabc", "Light Yellow"),
+    ("#4a6b3a", "Dark Olive"),
+    ("#87ff5e", "Light Green"),
+    ("#5a944a", "Olive"),
+    ("#84c573", "Light Olive"),
+    ("#13e67b", "Green"),
+    ("#0eb968", "Dark Green"),
+    ("#13e1be", "Light Teal"),
+    ("#0c816e", "Dark Teal"),
+    ("#bbfaf2", "Light Cyan"),
+    ("#10aea6", "Teal"),
+    ("#60f7f2", "Cyan"),
+    ("#0f799f", "Dark Cyan"),
+    ("#7dc7ff", "Light Blue"),
+    ("#4093e4", "Blue"),
+    ("#333941", "Dark Slate"),
+    ("#28509e", "Dark Blue"),
+    ("#6d758d", "Slate"),
+    ("#99b1fb", "Light Indigo"),
+    ("#b3b9d1", "Light Slate"),
+    ("#b5aef1", "Light Slate Blue"),
+    ("#7a71c4", "Slate Blue"),
+    ("#4a4284", "Dark Slate Blue"),
+    ("#6b50f6", "Indigo"),
+    ("#4d31b8", "Dark Indigo"),
+    ("#e09ff9", "Light Purple"),
+    ("#780c99", "Dark Purple"),
+    ("#aa38b9", "Purple"),
+    ("#cb007a", "Dark Pink"),
+    ("#ec1f80", "Pink"),
+    ("#f38da9", "Light Pink"),
+    ("#600018", "Deep Red"),
+    ("#a50e1e", "Dark Red"),
+    ("#000000", "Black"),
+    ("#3c3c3c", "Dark Gray"),
+    ("#787878", "Gray"),
+    ("#aaaaaa", "Medium Gray"),
+    ("#d2d2d2", "Light Gray"),
+    ("#ffffff", "White"),
 )
-
-# Derived views (names & tiers are used for the usage report)
-PALETTE_HEX: tuple[str, ...] = tuple(h for h, _, _ in PALETTE_ENTRIES)
-HEX_TO_NAME: Dict[str, str] = {h.lower(): n for h, n, _ in PALETTE_ENTRIES}
-HEX_TO_TIER: Dict[str, str] = {h.lower(): t for h, _, t in PALETTE_ENTRIES}
+PALETTE_HEX: tuple[str, ...] = tuple(h for h, _ in PALETTE_ENTRIES)
+HEX_TO_NAME: Dict[str, str] = {h.lower(): n for h, n in PALETTE_ENTRIES}
 
 
-# ---------------- Utils ----------------
+# ---------- Helpers ----------
 def parse_hex(code: str) -> Tuple[int, int, int]:
-    """'#RRGGBB' -> (R, G, B) as ints 0..255"""
     s = code[1:] if code.startswith("#") else code
     return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
 
 
-def build_palette() -> np.ndarray:
-    """Return unique RGB rows from PALETTE_ENTRIES as uint8 array [N,3]."""
+def build_palette_rgb() -> np.ndarray:
     cols = np.array([parse_hex(h) for h in PALETTE_HEX], dtype=np.uint8)
     # de-dup while preserving order
     _, idx = np.unique(cols.view([("", cols.dtype)] * cols.shape[1]), return_index=True)
@@ -118,14 +108,9 @@ def build_palette() -> np.ndarray:
 
 
 def _srgb_to_oklab(rgb_u8: np.ndarray) -> np.ndarray:
-    """sRGB uint8 -> OKLab float32 array of same leading shape [...,3]."""
     rgb = rgb_u8.astype(np.float32) / 255.0
-
-    # sRGB -> linear
     a = 0.055
     lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + a) / (1 + a)) ** 2.4)
-
-    # LMS
     l = (
         0.4122214708 * lin[..., 0]
         + 0.5363325363 * lin[..., 1]
@@ -141,29 +126,27 @@ def _srgb_to_oklab(rgb_u8: np.ndarray) -> np.ndarray:
         + 0.2817188376 * lin[..., 1]
         + 0.6299787005 * lin[..., 2]
     )
-
     l_ = np.cbrt(l)
     m_ = np.cbrt(m)
     s_ = np.cbrt(s)
     L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
     A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
     B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
-
     return np.stack([L, A, B], axis=-1).astype(np.float32)
 
 
 def _wrap(angle: np.ndarray) -> np.ndarray:
-    """Wrap angles to [-pi, pi]."""
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
 
-# ======== PHOTO MODE (classic nearest with chroma-aware anti-grey) ========
-# Higher -> fewer sources counted as "saturated"; Lower -> more sources counted as saturated.
-PHOTO_SRC_SAT_T: float = 0.06
-# Higher -> fewer palette colours treated as grey; Lower -> more palette colours treated as grey.
-PHOTO_PAL_GREY_T: float = 0.03
-# Higher -> stronger push away from grey targets for saturated sources; Lower -> weaker push.
-PHOTO_GREY_PENALTY: float = 1.7
+def _rgb_to_hex(row: np.ndarray) -> str:
+    return f"#{int(row[0]):02x}{int(row[1]):02x}{int(row[2]):02x}"
+
+
+# ---------- Photo mode ----------
+PHOTO_SRC_SAT_T = 0.06
+PHOTO_PAL_GREY_T = 0.03
+PHOTO_GREY_PENALTY = 1.7
 
 
 def _nearest_indices_oklab_photo(
@@ -172,518 +155,534 @@ def _nearest_indices_oklab_photo(
     src_chroma: np.ndarray,
     pal_chroma: np.ndarray,
 ) -> np.ndarray:
-    """Return nearest palette index per source colour (photo mode)."""
-    delta = src_lab[:, None, :] - pal_lab[None, :, :]
-    dist_sq = np.einsum("knc,knc->kn", delta, delta, optimize=True)
-
-    saturated_to_grey = (src_chroma[:, None] > PHOTO_SRC_SAT_T) & (
+    diff = src_lab[:, None, :] - pal_lab[None, :, :]
+    dist2 = np.einsum("knc,knc->kn", diff, diff, optimize=True)
+    mask = (src_chroma[:, None] > PHOTO_SRC_SAT_T) & (
         pal_chroma[None, :] < PHOTO_PAL_GREY_T
     )
-    if saturated_to_grey.any():
-        dist_sq = np.where(
-            saturated_to_grey, dist_sq * (PHOTO_GREY_PENALTY**2), dist_sq
-        )
-
-    nearest_idx = np.argmin(dist_sq, axis=1)
-    return nearest_idx
+    if mask.any():
+        dist2 = np.where(mask, dist2 * (PHOTO_GREY_PENALTY**2), dist2)
+    return np.argmin(dist2, axis=1)
 
 
-def palette_map_array_photo(rgb_flat: np.ndarray, palette: np.ndarray) -> np.ndarray:
-    """Vectorised nearest-colour mapping in OKLab (photo mode)."""
-    unique_rgb, inverse_idx = np.unique(rgb_flat, axis=0, return_inverse=True)
-    pal_lab = _srgb_to_oklab(palette)
-    pal_chroma = np.hypot(pal_lab[:, 1], pal_lab[:, 2])
-    src_lab = _srgb_to_oklab(unique_rgb)
-    src_chroma = np.hypot(src_lab[:, 1], src_lab[:, 2])
-    idx = _nearest_indices_oklab_photo(src_lab, pal_lab, src_chroma, pal_chroma)
-    return palette[idx][inverse_idx].astype(np.uint8)
+def map_photo_nearest(rgb_flat: np.ndarray, palette_rgb: np.ndarray) -> np.ndarray:
+    uniq_rgb, inv = np.unique(rgb_flat, axis=0, return_inverse=True)
+    pal_lab = _srgb_to_oklab(palette_rgb)
+    pal_C = np.hypot(pal_lab[:, 1], pal_lab[:, 2])
+    src_lab = _srgb_to_oklab(uniq_rgb)
+    src_C = np.hypot(src_lab[:, 1], src_lab[:, 2])
+    idx = _nearest_indices_oklab_photo(src_lab, pal_lab, src_C, pal_C)
+    return palette_rgb[idx][inv].astype(np.uint8)
 
 
-# ======== PIXEL MODE (global distance + matching + guards) ========
+# ---------- Pixel mode: general scoring ----------
 # Base OKLCh weights
-# Higher -> hue differences matter more; Lower -> hue differences matter less.
 HUE_WEIGHT_BASE = 0.45
-# Higher -> more sources considered above floor (slightly increases hue weight overall); Lower -> more sources near zero hue weight.
 CHROMA_FLOOR = 0.02
-# Higher -> slower ramp-up of hue weight as chroma increases; Lower -> faster ramp-up.
 CHROMA_RANGE = 0.12
 
-# Anti-grey for saturated sources (pixel mode)
-# Higher -> fewer sources counted as saturated; Lower -> more sources counted as saturated.
+# Anti-grey for saturated sources
 SRC_SAT_T = 0.04
-# Higher -> fewer palette colours treated as grey; Lower -> more palette colours treated as grey.
 PAL_GREY_T = 0.05
-# Higher -> stronger push away from grey targets; Lower -> weaker push.
 GREY_PENALTY = 2.0
 
-# Near-white guard for chromatic->white (legacy piece; kept)
-# Higher -> harder to map chromatic colours to very light greys/white; Lower -> easier.
-WHITE_L_T = 0.92
-# Higher -> stronger block of chromatic->white mapping; Lower -> weaker block.
-WHITE_PENALTY = 3.0
+# White / near-white guard
+WHITE_HARD_L = 0.97
+WHITE_HARD_C = 0.015
+NEARWHITE_L = 0.94
+NEARWHITE_C = 0.020
+NEARWHITE_BLOCK = 3.0
+WHITE_BONUS = 0.85
+VLGREY_BONUS = 0.92
 
-# Stronger brown guard (reduce greys drifting warm)
-# Center of "brown/orange" band (radians). Shift to aim the band.
-BROWN_HUE_C = np.deg2rad(35.0)
-# Higher -> wider band of hues considered brown; Lower -> narrower.
-BROWN_HUE_BW = np.deg2rad(50.0)
-# Higher -> only more saturated browns get penalized; Lower -> even weak browns get penalized.
-BROWN_CHROMA_MIN = 0.05
-# Higher -> stronger push away from warm browns for neutral sources; Lower -> weaker push.
-BROWN_PENALTY = 6.0
+# Neutral guard (keep greys neutral)
+NEUTRAL_SRC_C_MAX = 0.06
+NEUTRAL_L_MIN = 0.35
+NEUTRAL_L_MAX = 0.92
+WARM_HUE_CENTRE = np.deg2rad(35.0)  # orange/brown region
+WARM_HUE_BW = np.deg2rad(55.0)
+WARM_MIN_C = 0.04
+NEUTRAL_TO_WARM_PEN = 3.0
+NEUTRAL_TARGET_C_MAX = 0.10  # neutrals prefer palette with low chroma
 
-# Lightness guards to keep light colours from falling to deep choices
-# Higher -> larger allowed drop in L before penalty; Lower -> earlier penalty when mapping darker.
-LIGHT_DROP_L_T = 0.06
-# Higher -> only very light sources get guarded; Lower -> more mid-lights get guarded.
-LIGHT_SRC_T = 0.70
-# Higher -> requires closer hue match to trigger "same family" guard; Lower -> looser hue matching.
-HUE_CLOSE_T = np.deg2rad(28.0)
-# Higher -> requires closer chroma match to trigger guard; Lower -> looser chroma matching.
-CLOSE_CHROMA_T = 0.05
-# Higher -> stronger block when a light colour would fall to a deep one; Lower -> weaker block.
-LIGHT_DROP_PEN = 7.0
+# Pale-to-oversaturated clamp (generic, hue-agnostic)
+PALE_C = 0.05
+PALE_MAX_DELTA_C = 0.05
+PALE_OVER_PEN = 1.6
 
-# Soft bias against going darker (smooth, continuous)
-# Higher -> stronger soft penalty on going darker; Lower -> weaker.
-LIGHT_SOFT_W = 0.25
-# Higher -> the soft penalty kicks in only for brighter sources; Lower -> starts affecting midtones.
-LIGHT_SOFT_SRC = 0.60
-# Higher -> wider ramp region for the soft penalty; Lower -> narrower ramp.
-LIGHT_SOFT_SPAN = 0.35
+# Hue jump limiter (generic)
+HUE_JUMP_T = np.deg2rad(30.0)
+HUE_JUMP_SLOPE = 0.5  # multiplies extra cost when |Δh| > threshold
 
-# Candidate & sharing controls (kept conservative for pixel art)
-# Higher -> keep more near-best palette candidates; Lower -> keep fewer (more decisive).
+# Chroma direction consistency
+DELTA_C_TOL = 0.04
+CHROMA_BIG_JUMP_PEN = 1.5
+
+# Soft penalty for large lightness change (keeps mapping believable)
+DELTA_L_SOFT_TOL = 0.06
+DELTA_L_SOFT_WEIGHT = 0.35
+
+# Candidate set building
 GOOD_ENOUGH_RATIO = 1.06
-# Higher -> consider more candidates per source (slower, more flexible); Lower -> fewer (faster, stricter).
-MAX_CANDIDATES = 24
-# Higher -> easier to choose a different unused palette when best is taken; Lower -> harder (more reuse).
-SHARE_GUARD_RATIO = 1.08
-# Higher -> stricter about avoiding reuse when a free alternative is close; Lower -> reuse more often.
-STRICT_REUSE_RATIO = 1.10
+MAX_CANDIDATES = 22
+PEER_MIN_CANDS = 12  # for colours that touch many neighbours
 
-# Near-white clamp (stop "light cyan used as white" and favour white/light greys)
-# Higher -> only very bright pixels are treated as near-white; Lower -> more pixels treated as near-white.
-NEAR_WHITE_L_T = 0.94
-# Higher -> only extremely neutral pixels engage the near-white rules; Lower -> slightly tinted pixels also engage.
-NEAR_WHITE_C_T = 0.02
-# Higher -> stronger push away from cyan-tinted whites; Lower -> weaker push.
-NEAR_WHITE_CYAN_PEN = 3.0
-# Lower than 1.0 pulls more strongly toward white; set closer to 1.0 to weaken pull.
-NEAR_WHITE_WHITE_BONUS = 0.85
-# Lower than 1.0 pulls more strongly toward very light grey; closer to 1.0 weakens it.
-NEAR_WHITE_VLG_BONUS = 0.92
-# Cyan band center and width used in near-white clamp.
-CYAN_HUE_C = np.deg2rad(200.0)
-# Higher -> wider cyan band considered "bad" for near-white; Lower -> narrower.
-CYAN_HUE_BW = np.deg2rad(60.0)
-
-# Green vs "stone/grey" (nudge real greens toward greens/olives instead of stones)
-# Higher -> requires more saturated green sources to enable these tweaks; Lower -> triggers more often.
-GREEN_SRC_C_T = 0.06
-# Green center and band. Shift/resize to redefine what counts as "green".
-GREEN_HUE_C = np.deg2rad(130.0)
-GREEN_HUE_BW = np.deg2rad(55.0)
-# Stone center and band. Adjust to catch more or fewer stone-like hues.
-STONE_HUE_C = np.deg2rad(75.0)
-STONE_HUE_BW = np.deg2rad(30.0)
-# Higher -> only very low-chroma targets count as stone-ish; Lower -> more targets flagged as stone-ish.
-STONE_C_MAX = 0.14
-# Higher -> stronger push away from stone/grey when the source is green; Lower -> weaker.
-GREEN_TO_STONE_PEN = 1.2
-# Olive center and band. Adjust to pull greens more toward olive range.
-OLIVE_HUE_C = np.deg2rad(105.0)
-OLIVE_HUE_BW = np.deg2rad(30.0)
-# Higher -> only more saturated olives are favored; Lower -> weaker olives also favored.
-OLIVE_MIN_C = 0.10
-# Below 1.0 pulls more strongly toward olive/green; closer to 1.0 weakens pull.
-OLIVE_BONUS = 0.95
-
-# Neutral threshold used in a few places
-# Higher -> more pixels count as "neutral-ish"; Lower -> fewer.
-NEUTRAL_SRC_T = 0.06
-
-# Low-chroma green rescue (for cases like #3a553b)
-# Increase to include slightly stronger chroma greens; decrease to require very low chroma.
-LOWC_GREEN_C_MIN = 0.03
-# Increase to include higher chroma greens; decrease to restrict to very muted greens.
-LOWC_GREEN_C_MAX = 0.06
-# Higher -> broader hue band for "low-chroma green"; Lower -> tighter.
-LOWC_GREEN_HUE_BW = np.deg2rad(45.0)
-# Below 1.0 pulls toward olive/green more; closer to 1.0 reduces the pull.
-LOWC_GREEN_BONUS = 0.96
-# Higher -> stronger push away from stone/grey for low-chroma greens; Lower -> weaker.
-LOWC_GREEN_STONE_PEN = 1.3
-
-# Cyan (blue-cyan) vs Teal preference for light cyans
-# Higher -> require more chroma to trigger cyan vs teal logic; Lower -> trigger more often.
-CYAN_SRC_C_T = 0.05
-# Higher -> only lighter cyans get adjusted; Lower -> mid-light cyans can be adjusted too.
-CYAN_SRC_L_T = 0.65
-# Center and width of cyan detection band for the light-cyan rule.
-CYAN_HUE_BAND_C = np.deg2rad(200.0)
-# Higher -> detect a wider range of cyan-like sources; Lower -> narrower detection.
-CYAN_HUE_BAND_BW = np.deg2rad(35.0)
-# Teal target band center and width.
-TEAL_HUE_C = np.deg2rad(170.0)
-# Higher -> more target hues count as teal; Lower -> fewer.
-TEAL_HUE_BW = np.deg2rad(25.0)
-# Blue-cyan preferred band center and width.
-BLUECYAN_HUE_C = np.deg2rad(205.0)
-# Higher -> more target hues count as blue-cyan; Lower -> fewer.
-BLUECYAN_HUE_BW = np.deg2rad(35.0)
-# Higher -> stronger push away from teal for light cyans; Lower -> weaker.
-CYAN_TO_TEAL_PEN = 1.35
-# Below 1.0 pulls more toward blue-cyan; closer to 1.0 weakens the pull.
-CYAN_TO_BLUE_BONUS = 0.92
-# Higher -> allow slightly darker blue-cyan targets; Lower -> require almost no darkening.
-CYAN_NOT_DARKER_DL = 0.02
+# Neighbour separation
+HUE_CLUSTER_BW = np.deg2rad(28.0)  # tone ladder width
+ORDER_TOL_SRC = 0.003  # OKLab L tolerances
+ORDER_TOL_TGT = 0.003
 
 
-def compute_cost_matrix(src_rgb: np.ndarray, palette_rgb: np.ndarray) -> np.ndarray:
-    """
-    Build the OKLab-based cost matrix:
-      cost[row=source_color, col=palette_color] = distance with guards/biases.
-    """
-    # Convert to OKLab
-    palette_lab = _srgb_to_oklab(palette_rgb)
-    source_lab = _srgb_to_oklab(src_rgb)
+def compute_oklab_cost(src_rgb: np.ndarray, palette_rgb: np.ndarray) -> np.ndarray:
+    pal_lab = _srgb_to_oklab(palette_rgb)
+    src_lab = _srgb_to_oklab(src_rgb)
 
-    # Palette components
-    palette_L, palette_A, palette_B = (
-        palette_lab[:, 0],
-        palette_lab[:, 1],
-        palette_lab[:, 2],
-    )
-    palette_C = np.hypot(palette_A, palette_B)
-    palette_hue = np.arctan2(palette_B, palette_A)
+    pal_L = pal_lab[:, 0]
+    pal_a = pal_lab[:, 1]
+    pal_b = pal_lab[:, 2]
+    pal_C = np.hypot(pal_a, pal_b)
+    pal_h = np.arctan2(pal_b, pal_a)
 
-    # Source components
-    source_L, source_A, source_B = source_lab[:, 0], source_lab[:, 1], source_lab[:, 2]
-    source_C = np.hypot(source_A, source_B)
-    source_hue = np.arctan2(source_B, source_A)
+    src_L = src_lab[:, 0]
+    src_a = src_lab[:, 1]
+    src_b = src_lab[:, 2]
+    src_C = np.hypot(src_a, src_b)
+    src_h = np.arctan2(src_b, src_a)
 
     # Base OKLCh distance
-    delta_L_sq = (source_L[:, None] - palette_L[None, :]) ** 2
-    delta_C_sq = (source_C[:, None] - palette_C[None, :]) ** 2
-    delta_hue_wrapped = _wrap(source_hue[:, None] - palette_hue[None, :])
-    hue_weight = (
+    dL2 = (src_L[:, None] - pal_L[None, :]) ** 2
+    dC2 = (src_C[:, None] - pal_C[None, :]) ** 2
+    dh = _wrap(src_h[:, None] - pal_h[None, :])
+    hue_w = (
         HUE_WEIGHT_BASE
-        * np.clip((source_C - CHROMA_FLOOR) / CHROMA_RANGE, 0.0, 1.0)[:, None]
+        * np.clip((src_C - CHROMA_FLOOR) / CHROMA_RANGE, 0.0, 1.0)[:, None]
     )
+    cost = 0.6 * dL2 + 1.0 * dC2 + hue_w * (dh**2)
 
-    cost = 0.8 * delta_L_sq + 1.0 * delta_C_sq + hue_weight * (delta_hue_wrapped**2)
+    # Saturated sources should not fall to grey
+    to_grey = (src_C[:, None] > SRC_SAT_T) & (pal_C[None, :] < PAL_GREY_T)
+    if to_grey.any():
+        cost = np.where(to_grey, cost * (GREY_PENALTY**2), cost)
 
-    # Anti-grey for saturated sources
-    saturated_to_grey = (source_C[:, None] > SRC_SAT_T) & (
-        palette_C[None, :] < PAL_GREY_T
-    )
-    if saturated_to_grey.any():
-        cost = np.where(saturated_to_grey, cost * (GREY_PENALTY**2), cost)
-
-    # Block chromatic -> white
-    chroma_to_white = (
-        (source_C[:, None] > 0.04)
-        & (palette_C[None, :] < PAL_GREY_T)
-        & (palette_L[None, :] > WHITE_L_T)
-    )
-    if chroma_to_white.any():
-        cost = np.where(chroma_to_white, cost * (WHITE_PENALTY**2), cost)
-
-    # Near-white discourages cyan-ish substitutions; pulls toward white/v. light grey
-    near_white_src = (source_L > NEAR_WHITE_L_T) & (source_C < NEAR_WHITE_C_T)
-    if np.any(near_white_src):
-        palette_cyan_band = np.abs(_wrap(palette_hue - CYAN_HUE_C)) <= CYAN_HUE_BW
+    # White hard snap and near-white guard
+    # Find white index and very-light-grey mask once
+    pal_is_white = (pal_C < 0.010) & (pal_L > 0.985)
+    pal_is_vlgrey = (pal_C < 0.020) & (pal_L > 0.94)
+    # Hard snap to pure white
+    hard_white = (src_L >= WHITE_HARD_L) & (src_C <= WHITE_HARD_C)
+    if hard_white.any():
+        # make white cost minimal, others very large
+        nonwhite = ~pal_is_white[None, :]
         cost = np.where(
-            near_white_src[:, None] & palette_cyan_band[None, :],
-            cost * (NEAR_WHITE_CYAN_PEN**2),
-            cost,
-        )
-
-        palette_white_like = (palette_C < 0.015) & (palette_L > 0.97)
-        palette_vlight_grey = (palette_C < 0.030) & (palette_L > 0.92)
-
-        cost = np.where(
-            near_white_src[:, None] & palette_white_like[None, :],
-            cost * NEAR_WHITE_WHITE_BONUS,
-            cost,
+            hard_white[:, None] & nonwhite, cost * (NEARWHITE_BLOCK**4), cost
         )
         cost = np.where(
-            near_white_src[:, None] & palette_vlight_grey[None, :],
-            cost * NEAR_WHITE_VLG_BONUS,
-            cost,
+            hard_white[:, None] & pal_is_white[None, :], cost * WHITE_BONUS, cost
         )
-
-    # Brown guard for truly neutral sources
-    neutral_src_mask = source_C < NEUTRAL_SRC_T
-    palette_brown_band = (np.abs(_wrap(palette_hue - BROWN_HUE_C)) <= BROWN_HUE_BW) & (
-        palette_C >= BROWN_CHROMA_MIN
-    )
-    if np.any(palette_brown_band) and np.any(neutral_src_mask):
+    # Near-white preference
+    near_white = (src_L >= NEARWHITE_L) & (src_C <= NEARWHITE_C)
+    if near_white.any():
+        coloured = ~pal_is_vlgrey[None, :]
         cost = np.where(
-            neutral_src_mask[:, None] & palette_brown_band[None, :],
-            cost * (BROWN_PENALTY**2),
-            cost,
-        )
-
-    # Lightness soft bias (do not go darker if source is light) + hard light->deep guard
-    soft_lightness_weight = np.clip(
-        (source_L - LIGHT_SOFT_SRC) / max(LIGHT_SOFT_SPAN, 1e-6), 0.0, 1.0
-    )[:, None]
-    darker_than_source = np.clip(source_L[:, None] - palette_L[None, :], 0.0, 1.0)
-    cost = cost + LIGHT_SOFT_W * (soft_lightness_weight * (darker_than_source**2))
-
-    source_is_light = source_L > LIGHT_SRC_T
-    palette_is_too_dark = palette_L[None, :] < (source_L[:, None] - LIGHT_DROP_L_T)
-    hue_close_mask = (
-        np.abs(_wrap(source_hue[:, None] - palette_hue[None, :])) <= HUE_CLOSE_T
-    )
-    chroma_close_mask = np.abs(source_C[:, None] - palette_C[None, :]) <= CLOSE_CHROMA_T
-    forbid_light_to_deep = (
-        source_is_light[:, None]
-        & palette_is_too_dark
-        & hue_close_mask
-        & chroma_close_mask
-    )
-    if np.any(forbid_light_to_deep):
-        cost = np.where(forbid_light_to_deep, cost * (LIGHT_DROP_PEN**2), cost)
-
-    # Greens: discourage mapping to stone/grey; mild pull to olive/green
-    source_is_clearly_green = (source_C >= GREEN_SRC_C_T) & (
-        np.abs(_wrap(source_hue - GREEN_HUE_C)) <= GREEN_HUE_BW
-    )
-    if np.any(source_is_clearly_green):
-        lightness_close_mask = np.abs(source_L[:, None] - palette_L[None, :]) <= 0.10
-        palette_stone_band = (
-            np.abs(_wrap(palette_hue - STONE_HUE_C)) <= STONE_HUE_BW
-        ) | (palette_C < STONE_C_MAX)
-        cost = np.where(
-            source_is_clearly_green[:, None]
-            & palette_stone_band[None, :]
-            & lightness_close_mask,
-            cost * (GREEN_TO_STONE_PEN**2),
-            cost,
-        )
-
-        palette_olive_band = (
-            np.abs(_wrap(palette_hue - OLIVE_HUE_C)) <= OLIVE_HUE_BW
-        ) & (palette_C >= OLIVE_MIN_C)
-        palette_green_band = np.abs(_wrap(palette_hue - GREEN_HUE_C)) <= GREEN_HUE_BW
-        green_pull_mask = (
-            source_is_clearly_green[:, None]
-            & (palette_olive_band | palette_green_band)[None, :]
-            & lightness_close_mask
-        )
-        cost = np.where(green_pull_mask, cost * OLIVE_BONUS, cost)
-
-    # Low-chroma green rescue (e.g., #3a553b-like)
-    source_is_lowC_green = (
-        (source_C >= LOWC_GREEN_C_MIN)
-        & (source_C <= LOWC_GREEN_C_MAX)
-        & (np.abs(_wrap(source_hue - GREEN_HUE_C)) <= LOWC_GREEN_HUE_BW)
-    )
-    if np.any(source_is_lowC_green):
-        lightness_close_mask = np.abs(source_L[:, None] - palette_L[None, :]) <= 0.12
-        palette_olive_band = (
-            np.abs(_wrap(palette_hue - OLIVE_HUE_C)) <= OLIVE_HUE_BW
-        ) & (palette_C >= 0.08)
-        palette_green_band = np.abs(_wrap(palette_hue - GREEN_HUE_C)) <= GREEN_HUE_BW
-        palette_stoneish = (
-            np.abs(_wrap(palette_hue - STONE_HUE_C)) <= STONE_HUE_BW
-        ) | (palette_C < 0.10)
-
-        cost = np.where(
-            source_is_lowC_green[:, None]
-            & (palette_olive_band | palette_green_band)[None, :]
-            & lightness_close_mask,
-            cost * LOWC_GREEN_BONUS,
-            cost,
+            near_white[:, None] & coloured, cost * (NEARWHITE_BLOCK**2), cost
         )
         cost = np.where(
-            source_is_lowC_green[:, None]
-            & palette_stoneish[None, :]
-            & lightness_close_mask,
-            cost * (LOWC_GREEN_STONE_PEN**2),
-            cost,
+            near_white[:, None] & pal_is_white[None, :], cost * WHITE_BONUS, cost
+        )
+        cost = np.where(
+            near_white[:, None] & pal_is_vlgrey[None, :], cost * VLGREY_BONUS, cost
         )
 
-    # Light cyans: prefer blue-cyan over teal if not darker
-    source_is_light_cyan = (
-        (source_C >= CYAN_SRC_C_T)
-        & (source_L >= CYAN_SRC_L_T)
-        & (np.abs(_wrap(source_hue - CYAN_HUE_BAND_C)) <= CYAN_HUE_BAND_BW)
+    # Neutral greys avoid warm browns/tans and prefer low-chroma targets
+    src_is_neutral = (
+        (src_C <= NEUTRAL_SRC_C_MAX)
+        & (src_L >= NEUTRAL_L_MIN)
+        & (src_L <= NEUTRAL_L_MAX)
     )
-    if np.any(source_is_light_cyan):
-        palette_teal_band = np.abs(_wrap(palette_hue - TEAL_HUE_C)) <= TEAL_HUE_BW
-        palette_bluecyan_band = (
-            np.abs(_wrap(palette_hue - BLUECYAN_HUE_C)) <= BLUECYAN_HUE_BW
+    if src_is_neutral.any():
+        pal_is_warm = (np.abs(_wrap(pal_h - WARM_HUE_CENTRE)) <= WARM_HUE_BW) & (
+            pal_C >= WARM_MIN_C
         )
-        target_not_darker = palette_L[None, :] >= (
-            source_L[:, None] - CYAN_NOT_DARKER_DL
+        cost = np.where(
+            src_is_neutral[:, None] & pal_is_warm[None, :],
+            cost * (NEUTRAL_TO_WARM_PEN**2),
+            cost,
         )
+        pal_lowC = pal_C <= NEUTRAL_TARGET_C_MAX
+        cost = np.where(src_is_neutral[:, None] & pal_lowC[None, :], cost * 0.90, cost)
 
-        cost = np.where(
-            source_is_light_cyan[:, None] & palette_teal_band[None, :],
-            cost * (CYAN_TO_TEAL_PEN**2),
-            cost,
-        )
-        cost = np.where(
-            source_is_light_cyan[:, None]
-            & palette_bluecyan_band[None, :]
-            & target_not_darker,
-            cost * CYAN_TO_BLUE_BONUS,
-            cost,
-        )
+    # Pale colours should not jump to very saturated targets
+    src_is_pale = src_C <= PALE_C
+    if src_is_pale.any():
+        too_sat = pal_C[None, :] > (src_C[:, None] + PALE_MAX_DELTA_C)
+        cost = np.where(src_is_pale[:, None] & too_sat, cost * (PALE_OVER_PEN**2), cost)
+
+    # Hue jump limiter (for large hue swings on low-chroma sources)
+    big_hue_jump = np.abs(dh) > HUE_JUMP_T
+    low_chroma_src = src_C[:, None] < 0.12
+    cost = np.where(
+        big_hue_jump & low_chroma_src,
+        cost * (1.0 + HUE_JUMP_SLOPE * (np.abs(dh) - HUE_JUMP_T)),
+        cost,
+    )
+
+    # Chroma direction consistency (discourage large ΔC)
+    deltaC = pal_C[None, :] - src_C[:, None]
+    big_up = deltaC > DELTA_C_TOL
+    big_dn = deltaC < -DELTA_C_TOL
+    cost = np.where(
+        src_is_pale[:, None] & big_up, cost * (CHROMA_BIG_JUMP_PEN**2), cost
+    )
+    cost = np.where(
+        (src_C[:, None] > 0.12) & big_dn, cost * (CHROMA_BIG_JUMP_PEN**2), cost
+    )
+
+    # Soft penalty for large lightness change (hides extreme L jumps)
+    deltaL = pal_L[None, :] - src_L[:, None]
+    soft_L = np.maximum(0.0, np.abs(deltaL) - DELTA_L_SOFT_TOL)
+    cost = cost + DELTA_L_SOFT_WEIGHT * (soft_L**2)
 
     return cost
 
 
-def build_candidate_lists(cost: np.ndarray) -> List[np.ndarray]:
-    """
-    Per unique source colour, keep palette candidates within GOOD_ENOUGH_RATIO of the best,
-    up to MAX_CANDIDATES per row. Returns list of 1D index arrays.
-    """
-    num_src = cost.shape[0]
-    best_per_row = cost.min(axis=1)
-    palette_order = np.argsort(cost, axis=1)
-    candidate_lists: List[np.ndarray] = []
-    for i in range(num_src):
-        row_indices = palette_order[i]
-        row_indices = row_indices[
-            cost[i, row_indices] <= best_per_row[i] * GOOD_ENOUGH_RATIO
-        ]
-        if row_indices.size == 0:
-            row_indices = palette_order[i, :1]
-        candidate_lists.append(row_indices[:MAX_CANDIDATES])
-    return candidate_lists
+def build_candidate_lists(
+    cost: np.ndarray, min_count_for_peers: Set[int] | None = None
+) -> List[np.ndarray]:
+    """Keep candidates within GOOD_ENOUGH_RATIO of the best, limited to MAX_CANDIDATES.
+    If min_count_for_peers provided, indices in that set will be extended later."""
+    K = cost.shape[0]
+    best = cost.min(axis=1)
+    order = np.argsort(cost, axis=1)
+    out: List[np.ndarray] = []
+    for i in range(K):
+        r = order[i]
+        r = r[cost[i, r] <= best[i] * GOOD_ENOUGH_RATIO]
+        if r.size == 0:
+            r = order[i, :1]
+        out.append(r[:MAX_CANDIDATES])
+    return out
 
 
-def match_top_sources_to_unique_palette(
-    top_src_indices: np.ndarray, candidate_lists: List[np.ndarray], num_palette: int
+# ---------- Neighbour graph (8-neighbour) ----------
+ADJ_MAX_UNIQUES = 40000
+
+
+def _peer_sets_from_uimg(uimg: np.ndarray) -> List[Set[int]]:
+    H, W = uimg.shape
+    valid = uimg >= 0
+    if not np.any(valid):
+        return [set()]
+    K = int(uimg[valid].max()) + 1
+    if K <= 0:
+        return [set()]
+    if K > ADJ_MAX_UNIQUES:
+        return [set() for _ in range(K)]
+
+    counts: Dict[tuple[int, int], int] = {}
+    deg = np.zeros(K, dtype=np.int64)
+
+    def add_pairs(a: np.ndarray, b: np.ndarray) -> None:
+        m = (a >= 0) & (b >= 0) & (a != b)
+        if not np.any(m):
+            return
+        ia = a[m].astype(np.int32)
+        ib = b[m].astype(np.int32)
+        lo = np.minimum(ia, ib)
+        hi = np.maximum(ia, ib)
+        pairs = np.stack([lo, hi], axis=1)
+        uniq, cnt = np.unique(pairs, axis=0, return_counts=True)
+        for (i, j), c in zip(uniq, cnt):
+            key = (int(i), int(j))
+            counts[key] = counts.get(key, 0) + int(c)
+            deg[int(i)] += int(c)
+            deg[int(j)] += int(c)
+
+    add_pairs(uimg[:, :-1], uimg[:, 1:])  # right
+    add_pairs(uimg[:-1, :], uimg[1:, :])  # down
+    add_pairs(uimg[:-1, :-1], uimg[1:, 1:])  # diag down-right
+    add_pairs(uimg[:-1, 1:], uimg[1:, :-1])  # diag down-left
+
+    peers: List[Set[int]] = [set() for _ in range(K)]
+    for (i, j), c in counts.items():
+        if c <= 0:
+            continue
+        # connect both directions
+        peers[i].add(j)
+        peers[j].add(i)
+    return peers
+
+
+# ---------- Frequency-first assignment with peer awareness ----------
+def _topk_max_matching_iter(
+    top_idx: np.ndarray, cands: List[np.ndarray], num_pal: int, peers: List[Set[int]]
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Lightweight maximum bipartite matching for the most frequent source colours.
-
-    Returns:
-      palette_owner: length num_palette, value is source index that owns that palette,
-                     or -1 if unowned.
-      chosen_palette_for_source: length num_sources (len(candidate_lists)),
-                     value is palette index chosen for that source, or -1 if none.
+    Iterative Kuhn-style augmenting paths (no recursion).
+    Avoid assigning a palette already owned by a peer if an augmenting path exists.
     """
-    palette_owner = np.full(num_palette, -1, dtype=np.int32)
-    chosen_palette_for_source = np.full(len(candidate_lists), -1, dtype=np.int32)
+    owner = np.full(num_pal, -1, dtype=np.int32)
+    chosen = np.full(len(cands), -1, dtype=np.int32)
 
-    def try_assign(src_i: int, seen_palette: np.ndarray) -> bool:
-        for pal_j in candidate_lists[src_i]:
-            pal_j = int(pal_j)
-            if seen_palette[pal_j]:
+    for i_val in top_idx:
+        src = int(i_val)
+        seen = np.zeros(num_pal, dtype=bool)
+        parent = np.full(
+            num_pal, -1, dtype=np.int32
+        )  # remember which source led to palette
+        queue: List[int] = []
+
+        # seed with all allowed candidates not owned by peers
+        for pj in cands[src]:
+            j = int(pj)
+            if owner[j] != -1 and owner[j] in peers[src]:
                 continue
-            seen_palette[pal_j] = True
-            current_owner = int(palette_owner[pal_j])
-            if current_owner == -1 or try_assign(current_owner, seen_palette):
-                palette_owner[pal_j] = int(src_i)
-                chosen_palette_for_source[int(src_i)] = pal_j
-                return True
-        return False
+            if not seen[j]:
+                seen[j] = True
+                parent[j] = -2  # root marker
+                queue.append(j)
 
-    for src_i_val in top_src_indices:
-        src_i = int(src_i_val)
-        seen = np.zeros(num_palette, dtype=bool)
-        try_assign(src_i, seen)
-
-    return palette_owner, chosen_palette_for_source
-
-
-def map_visible_pixels_global(
-    rgb_vis_flat: np.ndarray, palette: np.ndarray
-) -> np.ndarray:
-    """
-    Global mapping for visible (non-transparent) pixels:
-      1) unique colours -> cost table -> candidate lists,
-      2) match most frequent uniques to distinct palette colours,
-      3) greedy fill with strict "do not reuse if close alt exists".
-    """
-    unique_colors, inverse_index, counts = np.unique(
-        rgb_vis_flat, axis=0, return_inverse=True, return_counts=True
-    )
-    num_unique_colors, num_palette_colors = unique_colors.shape[0], palette.shape[0]
-
-    cost = compute_cost_matrix(unique_colors, palette)
-    candidate_lists = build_candidate_lists(cost)
-
-    # Process most frequent unique colours first
-    src_order_by_count = np.argsort(-counts)
-    top_match_count = min(num_palette_colors, num_unique_colors)
-    top_src_indices = src_order_by_count[:top_match_count]
-
-    palette_owner, chosen_palette_for_source = match_top_sources_to_unique_palette(
-        top_src_indices, candidate_lists, num_palette_colors
-    )
-    used_palette_indices = set(int(j) for j in palette_owner if int(j) != -1)
-
-    chosen_palette_index_for_unique = np.full(num_unique_colors, -1, dtype=np.int32)
-
-    # Assign matched top colours
-    for src_i_val in top_src_indices:
-        src_i = int(src_i_val)
-        pal_j = int(chosen_palette_for_source[src_i])
-        if pal_j != -1:
-            chosen_palette_index_for_unique[src_i] = pal_j
-            used_palette_indices.add(pal_j)
-
-    # Greedy for remaining with stricter no-reuse and "good enough" guards
-    for src_i_val in src_order_by_count:
-        src_i = int(src_i_val)
-        if chosen_palette_index_for_unique[src_i] != -1:
-            continue
-
-        candidates_for_i = candidate_lists[src_i]
-        if candidates_for_i.size == 0:
-            candidates_for_i = np.argsort(cost[src_i])[:1]
-
-        best_idx = int(candidates_for_i[0])
-        best_cost = float(cost[src_i, best_idx])
-
-        # If best already used, try a close free alternative (SHARE_GUARD_RATIO)
-        if best_idx in used_palette_indices:
-            near_free_alt = None
-            for pal_j in candidates_for_i[1:]:
-                pal_j = int(pal_j)
-                if (
-                    pal_j not in used_palette_indices
-                    and cost[src_i, pal_j] <= best_cost * SHARE_GUARD_RATIO
-                ):
-                    near_free_alt = pal_j
-                    break
-            if near_free_alt is not None:
-                chosen_palette_index_for_unique[src_i] = near_free_alt
-                used_palette_indices.add(near_free_alt)
-                continue
-
-        # Avoid reusing any used palette if a free alt is within STRICT_REUSE_RATIO
-        free_alt = None
-        for pal_j in candidates_for_i:
-            pal_j = int(pal_j)
-            if pal_j in used_palette_indices:
-                continue
-            if cost[src_i, pal_j] <= best_cost * STRICT_REUSE_RATIO:
-                free_alt = pal_j
+        aug_end = -1
+        while queue:
+            j = queue.pop(0)
+            if owner[j] == -1:
+                aug_end = j
                 break
-        if free_alt is not None:
-            chosen_palette_index_for_unique[src_i] = free_alt
-            used_palette_indices.add(free_alt)
+            # explore the owner's alternative candidates
+            other = int(owner[j])
+            for pj2 in cands[other]:
+                k = int(pj2)
+                if owner[k] != -1 and owner[k] in peers[other]:
+                    continue
+                if not seen[k]:
+                    seen[k] = True
+                    parent[k] = j
+                    queue.append(k)
+
+        # build augmenting path if found
+        if aug_end != -1:
+            j = aug_end
+            cur_src = src
+            while True:
+                prev_owner = owner[j]
+                owner[j] = cur_src
+                chosen[cur_src] = j
+                if parent[j] == -2:
+                    break
+                j_prev = parent[j]
+                cur_src = int(owner[j_prev])
+                j = j_prev
+
+    return owner, chosen
+
+
+# ---------- Neighbour-aware greedy + post-passes ----------
+def map_with_neighbours(
+    uniq_rgb: np.ndarray,
+    inv: np.ndarray,
+    counts: np.ndarray,
+    palette_rgb: np.ndarray,
+    uimg: np.ndarray,  # 2D map of unique indices (-1 for transparent)
+) -> np.ndarray:
+    K, Np = uniq_rgb.shape[0], palette_rgb.shape[0]
+
+    # Score all (source×palette)
+    cost = compute_oklab_cost(uniq_rgb, palette_rgb)
+
+    # Candidate lists
+    cands = build_candidate_lists(cost)
+
+    # Peer sets (8-neighbour)
+    peers = _peer_sets_from_uimg(uimg)
+
+    # Expand candidate lists for peer-heavy colours
+    order_full = [np.argsort(cost[i]) for i in range(K)]
+    for i in range(K):
+        if peers[i] and cands[i].size < PEER_MIN_CANDS:
+            cands[i] = order_full[i][: max(PEER_MIN_CANDS, cands[i].size)]
+
+    # Frequency-first ordering
+    order_src = np.argsort(-counts)
+    topM = min(Np, K)
+    top_idx = order_src[:topM]
+
+    # Max-matching for the top block with peer awareness
+    owner, chosen_top = _topk_max_matching_iter(top_idx, cands, Np, peers)
+
+    used = set(int(j) for j in owner if int(j) != -1)
+    choice = np.full(K, -1, dtype=np.int32)
+    for i_val in top_idx:
+        ii = int(i_val)
+        cj = int(chosen_top[ii])
+        if cj != -1:
+            choice[ii] = cj
+
+    # Greedy for the rest, avoid neighbour collisions where possible
+    for i_val in order_src:
+        ii = int(i_val)
+        if choice[ii] != -1:
+            continue
+        row = cands[ii]
+        if row.size == 0:
+            row = np.argsort(cost[ii])[:1]
+
+        peer_used: Set[int] = {int(choice[j]) for j in peers[ii] if 0 <= choice[j] < Np}
+
+        # 1) first free non-neighbour palette
+        picked = None
+        for jv in row:
+            j = int(jv)
+            if j not in used and j not in peer_used:
+                picked = j
+                break
+        if picked is not None:
+            choice[ii] = picked
+            used.add(picked)
             continue
 
-        # Fall back to best (may reuse)
-        chosen_palette_index_for_unique[src_i] = best_idx
-        used_palette_indices.add(best_idx)
+        # 2) any non-neighbour (even if reused)
+        for jv in row:
+            j = int(jv)
+            if j not in peer_used:
+                choice[ii] = j
+                used.add(j)
+                break
+        if choice[ii] != -1:
+            continue
 
-    return palette[chosen_palette_index_for_unique][inverse_index].astype(np.uint8)
+        # 3) any free
+        for jv in row:
+            j = int(jv)
+            if j not in used:
+                choice[ii] = j
+                used.add(j)
+                break
+        if choice[ii] != -1:
+            continue
+
+        # 4) best
+        choice[ii] = int(row[0])
+        used.add(int(row[0]))
+
+    # --- Post-pass A: split neighbour collisions with tone ladder ---
+    pal_lab = _srgb_to_oklab(palette_rgb)
+    pal_L = pal_lab[:, 0]
+    pal_a = pal_lab[:, 1]
+    pal_b = pal_lab[:, 2]
+    pal_C = np.hypot(pal_a, pal_b)
+    pal_h = np.arctan2(pal_b, pal_a)
+
+    src_L = _srgb_to_oklab(uniq_rgb)[:, 0]
+    src_C = np.hypot(_srgb_to_oklab(uniq_rgb)[:, 1], _srgb_to_oklab(uniq_rgb)[:, 2])
+
+    for ii in range(K):
+        pi = int(choice[ii])
+        if pi < 0:
+            continue
+        for jj in peers[ii]:
+            if jj <= ii:
+                continue
+            pj = int(choice[jj])
+            if pj < 0:
+                continue
+            if pj != pi:
+                continue  # no collision
+
+            # Move the less frequent to a nearby tone in the same hue cluster if possible
+            move = ii if counts[ii] <= counts[jj] else jj
+            keep = jj if move == ii else ii
+            keep_h = pal_h[int(choice[keep])]
+            keep_L = pal_L[int(choice[keep])]
+            # tone ladder: same-hue cluster
+            cluster = np.where(np.abs(_wrap(pal_h - keep_h)) <= HUE_CLUSTER_BW)[0]
+            # Prefer entries that keep local order: darker if source is darker, else lighter
+            want_darker = src_L[move] < src_L[keep] - ORDER_TOL_SRC
+            cand_list = cands[move]
+            # iterate candidates in order, filter to cluster and not equal to keep
+            new_pick = None
+            for jv in cand_list:
+                j = int(jv)
+                if j == int(choice[keep]):
+                    continue
+                if j not in cluster:
+                    continue
+                # lightness order intention
+                if want_darker and pal_L[j] > keep_L + ORDER_TOL_TGT:
+                    continue
+                if (not want_darker) and pal_L[j] < keep_L - ORDER_TOL_TGT:
+                    continue
+                new_pick = j
+                break
+            # fallback: nearest in cluster even if order not perfect
+            if new_pick is None:
+                for jv in cand_list:
+                    j = int(jv)
+                    if j == int(choice[keep]):
+                        continue
+                    if j in cluster:
+                        new_pick = j
+                        break
+            if new_pick is not None:
+                choice[move] = new_pick
+
+    # --- Post-pass B: preserve neighbour gradient signs (L and C) ---
+    for ii in range(K):
+        pi = int(choice[ii])
+        if pi < 0:
+            continue
+        for jj in peers[ii]:
+            if jj <= ii:
+                continue
+            pj = int(choice[jj])
+            if pj < 0:
+                continue
+            # Source relations
+            dL_src = src_L[ii] - src_L[jj]
+            dC_src = src_C[ii] - src_C[jj]
+            # Target relations
+            dL_tgt = pal_L[pi] - pal_L[pj]
+            dC_tgt = pal_C[pi] - pal_C[pj]
+
+            # If signs flip materially, try to nudge the less frequent to restore sign
+            need_fix_L = (abs(dL_src) > ORDER_TOL_SRC) and (
+                np.sign(dL_src) != np.sign(dL_tgt)
+            )
+            need_fix_C = (abs(dC_src) > 0.01) and (np.sign(dC_src) != np.sign(dC_tgt))
+
+            if need_fix_L or need_fix_C:
+                move = ii if counts[ii] <= counts[jj] else jj
+                keep = jj if move == ii else ii
+                target_L = pal_L[int(choice[keep])] + (
+                    ORDER_TOL_TGT * (-1 if dL_src > 0 else 1)
+                )
+                target_C = pal_C[int(choice[keep])] + (0.01 * (-1 if dC_src > 0 else 1))
+
+                # Try to find a candidate for 'move' that restores the sign(s)
+                new_pick = None
+                for jv in cands[move]:
+                    j = int(jv)
+                    if j == int(choice[keep]):
+                        continue
+                    okL = True
+                    okC = True
+                    if need_fix_L:
+                        okL = (dL_src > 0 and pal_L[j] > target_L - ORDER_TOL_TGT) or (
+                            dL_src < 0 and pal_L[j] < target_L + ORDER_TOL_TGT
+                        )
+                    if need_fix_C:
+                        okC = (dC_src > 0 and pal_C[j] > target_C - 0.005) or (
+                            dC_src < 0 and pal_C[j] < target_C + 0.005
+                        )
+                    if okL and okC:
+                        new_pick = j
+                        break
+                if new_pick is not None:
+                    choice[move] = new_pick
+
+    return palette_rgb[choice][inv].astype(np.uint8)
 
 
-# ------------- Shared helpers -------------
-def scale_to_height(img: Image.Image, target_h: int) -> Image.Image:
-    """Downsize to target height using BOX; never upscale."""
+# ---------- IO / reporting ----------
+def downscale_to_height(img: Image.Image, target_h: int) -> Image.Image:
     if target_h <= 0:
         return img
     w, h = img.width, img.height
@@ -693,8 +692,7 @@ def scale_to_height(img: Image.Image, target_h: int) -> Image.Image:
     return img.resize((new_w, target_h), resample=Image.Resampling.BOX)
 
 
-def report_usage(img: Image.Image) -> None:
-    """Print colours used with names and tiers (no hex), sorted by count desc."""
+def print_usage_report(img: Image.Image) -> None:
     arr = np.array(img, dtype=np.uint8)
     if img.mode == "RGBA":
         mask = arr[:, :, 3] > 0
@@ -707,89 +705,111 @@ def report_usage(img: Image.Image) -> None:
 
     uniq, counts = np.unique(cols, axis=0, return_counts=True)
 
-    def _rgb_to_hex(row: np.ndarray) -> str:
-        return f"#{int(row[0]):02x}{int(row[1]):02x}{int(row[2]):02x}"
+    def _hx(row: np.ndarray) -> str:
+        return f"#{int(row[0]):02x}{int(row[1]):02x}{int(row[2]):02x}".lower()
 
-    items: List[tuple[int, str, str]] = []
-    for rgbv, cnt in zip(uniq, counts):
-        hx = _rgb_to_hex(rgbv).lower()
-        name = HEX_TO_NAME.get(hx, "Unknown")
-        tier = HEX_TO_TIER.get(hx, "Premium")
-        items.append((cnt, name, tier))
+    items = [
+        (int(cnt), _hx(rgb), HEX_TO_NAME.get(_hx(rgb), "Unknown"))
+        for rgb, cnt in zip(uniq, counts)
+    ]
     items.sort(key=lambda t: t[0], reverse=True)
-
     print("Colours used:")
-    for cnt, name, tier in items:
-        print(f"{name} [{tier}]: {cnt}")
+    for cnt, hx, name in items:
+        print(f"{hx}  {name}: {cnt}")
 
 
-# ------------- Pipeline -------------
+# ---------- Pipeline ----------
 def process(
-    input_path: str, output_path: str | None, target_height: int, mode: str
+    input_path: str,
+    output_path: str | None,
+    target_height: int,
+    mode: str,
+    auto_photo_threshold: int,
 ) -> None:
-    palette = build_palette()
+    palette_rgb = build_palette_rgb()
 
-    # Load & convert (preserve transparency; handles PNG P/tRNS as well)
-    im_in = Image.open(input_path)
-    im_rgba = im_in.convert("RGBA")
-    im_small = scale_to_height(im_rgba, target_height)
+    im = Image.open(input_path).convert("RGBA")
+    im = downscale_to_height(im, target_height)
+    arr = np.array(im, dtype=np.uint8)
+    H, W = arr.shape[:2]
 
-    arr = np.array(im_small, dtype=np.uint8)
-    h, w = arr.shape[:2]
+    rgb_all = arr[:, :, :3].reshape(-1, 3)
+    alpha = arr[:, :, 3].reshape(-1)
+    vis_mask = alpha > 0
 
-    rgb = arr[:, :, :3].reshape(-1, 3)
-    a = arr[:, :, 3].reshape(-1)
-    vis_mask = a > 0
-
-    # Mode selection
     chosen_mode = mode
     if mode == "auto":
-        # Heuristic: many unique visible colours -> photo; otherwise pixel
-        uniq_vis = np.unique(rgb[vis_mask], axis=0).shape[0] if vis_mask.any() else 0
-        chosen_mode = "photo" if uniq_vis > 4096 else "pixel"
+        uniq_vis_est = (
+            np.unique(rgb_all[vis_mask], axis=0).shape[0] if vis_mask.any() else 0
+        )
+        chosen_mode = "photo" if uniq_vis_est > auto_photo_threshold else "pixel"
 
-    # Map visible pixels
-    rgb_out = rgb.copy()
+    rgb_out = rgb_all.copy()
     if vis_mask.any():
         if chosen_mode == "pixel":
-            mapped = map_visible_pixels_global(rgb[vis_mask], palette)
+            # uniques for visible pixels
+            uniq_rgb, inv, counts = np.unique(
+                rgb_all[vis_mask], axis=0, return_inverse=True, return_counts=True
+            )
+
+            # 2D map of unique indices (-1 elsewhere) for neighbour discovery
+            uimg = np.full((H, W), -1, dtype=np.int32)
+            flat_vis = np.flatnonzero(vis_mask.reshape(H * W))
+            ys = flat_vis // W
+            xs = flat_vis % W
+            uimg[ys, xs] = inv
+
+            mapped = map_with_neighbours(uniq_rgb, inv, counts, palette_rgb, uimg)
         else:
-            mapped = palette_map_array_photo(rgb[vis_mask], palette)
+            mapped = map_photo_nearest(rgb_all[vis_mask], palette_rgb)
+
         rgb_out[vis_mask] = mapped
 
-    out = np.dstack([rgb_out.reshape(h, w, 3), a.reshape(h, w)]).astype(np.uint8)
-    out_img = Image.fromarray(out)
+    out = np.dstack([rgb_out.reshape(H, W, 3), alpha.reshape(H, W)]).astype(np.uint8)
+    out_img = Image.fromarray(out, mode="RGBA")
 
-    # Output path
-    if output_path is None or output_path == "":
+    if not output_path:
         out_path = Path(input_path).with_name(f"{Path(input_path).stem}_wplace.png")
     else:
         out_path = Path(output_path)
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_img.save(out_path, format="PNG", optimize=False)
+
     print(f"Mode: {chosen_mode}")
-    print(f"Wrote {out_path} | size={w}x{h} | palette_size={len(PALETTE_ENTRIES)}\n")
-    report_usage(out_img)
+    print(f"Wrote {out_path} | size={W}x{H} | palette_size={len(PALETTE_ENTRIES)}")
+    print_usage_report(out_img)
 
 
+# ---------- CLI ----------
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Dual-mode palette mapper with lightness/neutrality guards and strict global uniqueness."
+    p = argparse.ArgumentParser(
+        description="OKLab palette mapper: closest-first, frequency conflict resolution, neighbour tone-pairing, and generic guardrails."
     )
-    ap.add_argument("input", type=str)
-    ap.add_argument(
-        "--output",
+    p.add_argument("input", type=str, help="Input image file")
+    p.add_argument(
+        "output",
         type=str,
-        default=None,
+        nargs="?",
         help="Output PNG path; default '<input_stem>_wplace.png'",
     )
-    ap.add_argument(
-        "--height", type=int, default=512, help="Output height (downsize only)"
+    p.add_argument(
+        "--height", type=int, default=0, help="Downscale height; 0 keeps size"
     )
-    ap.add_argument("--mode", choices=["auto", "pixel", "photo"], default="auto")
-    args = ap.parse_args()
-    process(args.input, args.output, args.height, args.mode)
+    p.add_argument(
+        "--mode",
+        choices=["auto", "pixel", "photo"],
+        default="auto",
+        help="Mapping mode",
+    )
+    p.add_argument(
+        "--auto-threshold",
+        type=int,
+        default=4096,
+        help="Unique visible colour threshold for auto photo mode",
+    )
+    args = p.parse_args()
+
+    process(args.input, args.output, args.height, args.mode, args.auto_threshold)
 
 
 if __name__ == "__main__":
