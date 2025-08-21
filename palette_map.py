@@ -1,31 +1,52 @@
 #!/usr/bin/env python3
 """
-palette_map_dual.py — closest-first + frequency-conflict + neighbour tone-pairing
-(with soft, general guardrails; no hard-coded colour exceptions)
+palette_map.py
 
-- pixel: OKLab/OKLCh cost with generic constraints, frequency-first assignment
-         with peer awareness, neighbour separation, gradient sign preservation.
-- photo: OKLab nearest with a mild "don't collapse vivid colours to grey" bias.
+Palette-constrained image remapper.
 
-Alpha preserved. No upscaling.
-Default output "<input_stem>_wplace.png".
-Prints palette usage (hex, name, count).
+Primary purpose:
+- Read an input image (any format Pillow can open).
+- Optionally downscale by TARGET HEIGHT ONLY (never upscale).
+- Hard-threshold alpha to 0/255 (fully transparent or fully opaque).
+- Map all visible pixels to a fixed colour palette.
+- Two rendering strategies:
+    * pixel : best for pixel art / low unique-colour images.
+    * photo : preserves photo-like detail while still mapping to the palette.
+- Auto mode picks between the two.
 
-Examples
-  python palette_map_dual.py input.png
-  python palette_map_dual.py input.png --mode pixel --height 512
-  python palette_map_dual.py input.png --mode photo
+CLI:
+    palette_map.py INPUT [--output OUT.png]
+                         [--mode {auto,pixel,photo}]
+                         [--height H]
+                         [--debug]
+
+Notes:
+- Only three arguments: mode, height, debug (plus optional output path).
+- Scaling uses height only. If requested height >= image height, no scaling occurs.
+- Alpha is binarised with a hard threshold (no partial transparency in output).
+- The output is always PNG (so alpha is preserved cleanly).
+- Debug prints are ASCII only (no special characters).
 """
 
 from __future__ import annotations
-from pathlib import Path
-from typing import Tuple, Dict, List, Set
+
 import argparse
+import math
+import os
+import time
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
 import numpy as np
 from PIL import Image
 
-# ---------- Palette (wheel → greyscale) ----------
-PALETTE_ENTRIES: tuple[tuple[str, str], ...] = (
+# ===================== USER PALETTE (hex, name) =====================
+# Order matters only for reporting. All matching is distance-based.
+
+PALETTE: List[Tuple[str, str]] = [
     ("#ed1c24", "Red"),
     ("#d18078", "Peach"),
     ("#fa8072", "Light Red"),
@@ -84,732 +105,1330 @@ PALETTE_ENTRIES: tuple[tuple[str, str], ...] = (
     ("#600018", "Deep Red"),
     ("#a50e1e", "Dark Red"),
     ("#000000", "Black"),
-    ("#3c3c3c", "Dark Gray"),
-    ("#787878", "Gray"),
-    ("#aaaaaa", "Medium Gray"),
-    ("#d2d2d2", "Light Gray"),
+    ("#3c3c3c", "Dark Grey"),
+    ("#787878", "Grey"),
+    ("#aaaaaa", "Medium Grey"),
+    ("#d2d2d2", "Light Grey"),
     ("#ffffff", "White"),
-)
-PALETTE_HEX: tuple[str, ...] = tuple(h for h, _ in PALETTE_ENTRIES)
-HEX_TO_NAME: Dict[str, str] = {h.lower(): n for h, n in PALETTE_ENTRIES}
+]
 
 
-# ---------- Helpers ----------
-def parse_hex(code: str) -> Tuple[int, int, int]:
-    s = code[1:] if code.startswith("#") else code
-    return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+# ===================== TUNING (photo mode) =====================
+# These weights/cutoffs balance fidelity vs palette correctness.
+
+W_LOCAL_BASE = 0.18  # Weight for keeping local contrast consistent
+GRAD_K = 12.0  # Edge magnitude scale for local weighting
+W_HUE = 0.06  # Weight for hue consistency
+W_CHROMA = 0.05  # Weight for matching chroma (saturation)
+W_WASH = 0.65  # (reserved, not used directly; kept for clarity)
+L_WASH_THRESH = 4.0  # (reserved)
+W_DESAT = 0.05  # (reserved)
+C_DESAT_THRESH = 10.0  # (reserved)
+BLUR_RADIUS = 2  # Radius for local-L blur used in contrast guidance
+W_CONTRAST = 0.15  # Penalty if target flattens local contrast too much
+CONTRAST_MARGIN = 0.8  # Allow small contrast differences before penalising
+
+NEUTRAL_C_MAX = 6.0  # Chroma threshold considered neutral (greys/near-greys)
+CHROMA_SRC_MIN = 10.0  # If source is more saturated than this, avoid mapping to neutral
+NEUTRAL_PENALTY = 8.0  # Penalty for sending saturated colours to neutral targets
+NEUTRAL_EST_C = 8.0  # For global a/b bias estimation, consider colours with C <= this
+NEUTRAL_EST_LMIN = 20.0  # L range for neutral estimation
+NEUTRAL_EST_LMAX = 80.0
+AB_BIAS_GAIN = 0.8  # How strongly to subtract global a/b drift
+
+NEAR_NEUTRAL_C = 4.0  # Very low chroma considered near-neutral
+NEAR_BLACK_L = 32.0  # Very dark L considered "near black"
+NEAR_WHITE_L = 86.0  # Very bright L considered "near white"
+
+SHADOW_L = 38.0  # Below this, allow some hue/chroma boosting for legibility
+W_SHADOW_HUE = 0.12
+W_SHADOW_CHROMA_UP = 0.10
+
+EL_CLAMP = 6.0  # Clamp L error diffusion to avoid ringing
+Q_L = 0.5
+Q_A = 1.0
+Q_B = 1.0
+Q_LOC = 1.0
+Q_W = 0.05  # (reserved)
+PHOTO_TOPK = 6  # Photo mode: prefilter to this many nearest candidates
+
+ALPHA_THRESH = 128  # Hard threshold alpha; below -> 0, above/equal -> 255
 
 
-def build_palette_rgb() -> np.ndarray:
-    cols = np.array([parse_hex(h) for h in PALETTE_HEX], dtype=np.uint8)
-    # de-dup while preserving order
-    _, idx = np.unique(cols.view([("", cols.dtype)] * cols.shape[1]), return_index=True)
-    return cols[np.sort(idx)]
+# ===================== PIXEL mode stability =====================
+# These guide "unique-colour to palette" assignment under conflicts.
+
+SWAP_MARGIN = 1.0  # How much better a candidate must be to evict a holder
+W_HUE_PX = 0.35  # Add hue distance to CIEDE2000 to prefer closer hues
+HUE_PX_SCALE = 30.0  # Hue penalty scale (deg)
+PIXEL_SAT_C = 20.0  # If source chroma >= this, avoid mapping to neutrals
+H_RING = 25.0  # Larger hue mismatch ring penalty threshold
+W_HUE_RING = 0.6  # Penalty for hue mismatches beyond H_RING
+L_DARK = 45.0  # For dark sources, avoid jumping too bright
+L_DARK_MAX_UP = 10.0  # Allow some brightening for darks
+W_L_DARK = 0.30  # Penalty for brightening dark colours too much
+
+H_REEVAL = 28.0  # If chosen hue is far, try to re-evaluate
+COST_TOL_REEVAL = 6.0  # Allow some cost slack when re-evaluating
+
+# Prefer brighter targets; avoid mapping saturated sources to near-neutrals.
+W_BRIGHT_PX = 0.12
+PREF_HUE_DEG = 35.0
+PREF_MIN_TC_ABS = 8.0
+PREF_MIN_TC_REL = 0.50
+PREF_ENFORCE_C = 14.0  # If source chroma >= this, hard-skip non-preferred candidates
 
 
-def _srgb_to_oklab(rgb_u8: np.ndarray) -> np.ndarray:
-    rgb = rgb_u8.astype(np.float32) / 255.0
-    a = 0.055
-    lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + a) / (1 + a)) ** 2.4)
-    l = (
-        0.4122214708 * lin[..., 0]
-        + 0.5363325363 * lin[..., 1]
-        + 0.0514459929 * lin[..., 2]
+# ===================== Colour maths =====================
+
+
+def hex_to_rgb_u8(hx: str) -> Tuple[int, int, int]:
+    """Convert '#rrggbb' to 8-bit RGB tuple."""
+    hx = hx.lstrip("#")
+    return (int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16))
+
+
+def rgb_to_hex(rgb: Iterable[int]) -> str:
+    """Convert (r,g,b) to '#rrggbb'."""
+    r, g, b = list(rgb)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _srgb_to_linear(u: np.ndarray) -> np.ndarray:
+    """sRGB to linear RGB."""
+    return np.where(u <= 0.04045, u / 12.92, ((u + 0.055) / 1.055) ** 2.4)
+
+
+def srgb_to_lab_batch(rgb_u8: np.ndarray) -> np.ndarray:
+    """Vectorised sRGB -> CIE Lab (D65). Accepts (...,3) uint8, returns same shape float32."""
+    orig_shape = rgb_u8.shape
+    flat = rgb_u8.reshape(-1, 3).astype(np.float32) / 255.0
+    rl = _srgb_to_linear(flat[:, 0])
+    gl = _srgb_to_linear(flat[:, 1])
+    bl = _srgb_to_linear(flat[:, 2])
+
+    # XYZ transform (sRGB D65)
+    X = rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375
+    Y = rl * 0.2126729 + gl * 0.7151522 + bl * 0.0721750
+    Z = rl * 0.0193339 + gl * 0.1191920 + bl * 0.9503041
+
+    # Normalise by white point (D65)
+    Xn, Yn, Zn = 0.95047, 1.0, 1.08883
+    x = X / Xn
+    y = Y / Yn
+    z = Z / Zn
+
+    def f(t: np.ndarray) -> np.ndarray:
+        return np.where(t > 0.008856, np.cbrt(t), 7.787 * t + 16.0 / 116.0)
+
+    fx = f(x)
+    fy = f(y)
+    fz = f(z)
+    L = 116.0 * fy - 16.0
+    a = 500.0 * (fx - fy)
+    b = 200.0 * (fy - fz)
+    lab = np.stack([L, a, b], axis=1).astype(np.float32)
+    return lab.reshape(orig_shape)
+
+
+def lab_to_lch_batch(lab: np.ndarray) -> np.ndarray:
+    """Vectorised Lab -> LCh. Accepts (...,3) float32, returns same shape float32."""
+    orig_shape = lab.shape
+    flat = lab.reshape(-1, 3).astype(np.float32)
+    L = flat[:, 0]
+    a = flat[:, 1]
+    b = flat[:, 2]
+    C = np.hypot(a, b)
+    h = np.degrees(np.arctan2(b, a))
+    h = (h + 360.0) % 360.0
+    lch = np.stack([L, C, h], axis=1).astype(np.float32)
+    return lch.reshape(orig_shape)
+
+
+def ciede2000_pair(lab1: np.ndarray, lab2: np.ndarray) -> float:
+    """CIEDE2000 colour difference between two Lab triplets (float32 arrays of shape (3,))."""
+    L1, a1, b1 = lab1.tolist()
+    L2, a2, b2 = lab2.tolist()
+    C1 = math.hypot(a1, b1)
+    C2 = math.hypot(a2, b2)
+    Cm = 0.5 * (C1 + C2)
+    G = 0.5 * (1 - math.sqrt((Cm**7) / (Cm**7 + 25**7)))
+    a1p = (1 + G) * a1
+    a2p = (1 + G) * a2
+    C1p = math.hypot(a1p, b1)
+    C2p = math.hypot(a2p, b2)
+    h1p = (math.degrees(math.atan2(b1, a1p)) + 360.0) % 360.0
+    h2p = (math.degrees(math.atan2(b2, a2p)) + 360.0) % 360.0
+    dLp = L2 - L1
+    dCp = C2p - C1p
+    dhp = h2p - h1p
+    if C1p * C2p == 0:
+        dhp = 0.0
+    elif dhp > 180.0:
+        dhp -= 360.0
+    elif dhp < -180.0:
+        dhp += 360.0
+    dHp = 2.0 * math.sqrt(C1p * C2p) * math.sin(math.radians(dhp) / 2.0)
+    Lpm = (L1 + L2) / 2.0
+    Cpm = (C1p + C2p) / 2.0
+    if C1p * C2p == 0:
+        hpm = h1p + h2p
+    elif abs(h1p - h2p) <= 180.0:
+        hpm = 0.5 * (h1p + h2p)
+    else:
+        hpm = (
+            0.5 * (h1p + h2p + 360.0)
+            if (h1p + h2p) < 360.0
+            else 0.5 * (h1p + h2p - 360.0)
+        )
+    T = (
+        1
+        - 0.17 * math.cos(math.radians(hpm - 30.0))
+        + 0.24 * math.cos(math.radians(2.0 * hpm))
+        + 0.32 * math.cos(math.radians(3.0 * hpm + 6.0))
+        - 0.20 * math.cos(math.radians(4.0 * hpm - 63.0))
     )
-    m = (
-        0.2119034982 * lin[..., 0]
-        + 0.6806995451 * lin[..., 1]
-        + 0.1073969566 * lin[..., 2]
+    d_ro = 30.0 * math.exp(-(((hpm - 275.0) / 25.0) ** 2.0))
+    Rc = 2.0 * math.sqrt((Cpm**7.0) / (Cpm**7.0 + 25.0**7.0))
+    Sl = 1.0 + (0.015 * (Lpm - 50.0) ** 2.0) / math.sqrt(20.0 + (Lpm - 50.0) ** 2.0)
+    Sc = 1.0 + 0.045 * Cpm
+    Sh = 1.0 + 0.015 * Cpm * T
+    Rt = -math.sin(math.radians(2.0 * d_ro)) * Rc
+    dE = math.sqrt(
+        (dLp / Sl) ** 2
+        + (dCp / Sc) ** 2
+        + (dHp / Sh) ** 2
+        + Rt * (dCp / Sc) * (dHp / Sh)
     )
-    s = (
-        0.0883024619 * lin[..., 0]
-        + 0.2817188376 * lin[..., 1]
-        + 0.6299787005 * lin[..., 2]
-    )
-    l_ = np.cbrt(l)
-    m_ = np.cbrt(m)
-    s_ = np.cbrt(s)
-    L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
-    A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
-    B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
-    return np.stack([L, A, B], axis=-1).astype(np.float32)
+    return float(dE)
 
 
-def _wrap(angle: np.ndarray) -> np.ndarray:
-    return (angle + np.pi) % (2 * np.pi) - np.pi
+# ===================== IO + resizing =====================
 
 
-def _rgb_to_hex(row: np.ndarray) -> str:
-    return f"#{int(row[0]):02x}{int(row[1]):02x}{int(row[2]):02x}"
+def binarize_alpha(alpha: np.ndarray, thresh: int = ALPHA_THRESH) -> np.ndarray:
+    """Hard-threshold alpha to 0 or 255."""
+    return np.where(alpha.astype(np.int16) >= int(thresh), 255, 0).astype(np.uint8)
 
 
-# ---------- Photo mode ----------
-PHOTO_SRC_SAT_T = 0.06
-PHOTO_PAL_GREY_T = 0.03
-PHOTO_GREY_PENALTY = 1.7
+def load_image_rgba(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """Load an image, convert to RGBA, return (rgb, alpha) uint8 arrays."""
+    im = Image.open(path).convert("RGBA")
+    arr = np.array(im, dtype=np.uint8)
+    rgb = arr[..., :3]
+    alpha = binarize_alpha(arr[..., 3])
+    return rgb, alpha
 
 
-def _nearest_indices_oklab_photo(
-    src_lab: np.ndarray,
+def save_image_rgba(path: Path, rgb: np.ndarray, alpha: np.ndarray) -> Path:
+    """Save an RGBA PNG (force .png if needed)."""
+    if path.suffix.lower() != ".png":
+        path = path.with_suffix(".png")
+    out = np.zeros((rgb.shape[0], rgb.shape[1], 4), dtype=np.uint8)
+    out[..., :3] = rgb
+    out[..., 3] = binarize_alpha(alpha)
+    Image.fromarray(out).save(path)
+    return path
+
+
+def resize_rgba_height(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    dst_h: int,
+    resample: Image.Resampling,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Downscale by height only. If dst_h is None or >= original height, return input unchanged.
+    Uses a 4-channel pass, then re-binarises alpha to keep it crisp.
+    """
+    H0, W0, _ = rgb.shape
+    if dst_h is None or dst_h <= 0 or dst_h >= H0:
+        return rgb, binarize_alpha(alpha)
+
+    dst_w = int(round(W0 * (dst_h / float(H0))))
+    rgba = np.zeros((H0, W0, 4), dtype=np.uint8)
+    rgba[..., :3] = rgb
+    rgba[..., 3] = alpha
+    im = Image.fromarray(rgba)
+    im2 = im.resize((dst_w, dst_h), resample=resample)
+    arr = np.array(im2, dtype=np.uint8)
+    rgb2 = arr[..., :3]
+    a2 = binarize_alpha(arr[..., 3])
+    return rgb2, a2
+
+
+# ===================== Structures =====================
+
+
+@dataclass(frozen=True)
+class PaletteItem:
+    """A colour in the palette, with multiple representations for fast matching."""
+
+    rgb: Tuple[int, int, int]
+    name: str
+    lab: np.ndarray
+    lch: np.ndarray
+
+
+@dataclass(frozen=True)
+class SourceItem:
+    """A unique source colour visible in the image, with count and Lab/LCh."""
+
+    rgb: Tuple[int, int, int]
+    count: int
+    lab: np.ndarray
+    lch: np.ndarray
+
+
+# ===================== Build sets =====================
+
+
+def build_palette() -> (
+    Tuple[List[PaletteItem], Dict[Tuple[int, int, int], str], np.ndarray, np.ndarray]
+):
+    """Build palette items and matrices for Lab/LCh."""
+    rgbs = np.array([hex_to_rgb_u8(hx) for hx, _ in PALETTE], dtype=np.uint8)
+    labs = srgb_to_lab_batch(rgbs).reshape(-1, 3)
+    lchs = lab_to_lch_batch(labs).reshape(-1, 3)
+    items: List[PaletteItem] = []
+    name_of: Dict[Tuple[int, int, int], str] = {}
+    for i, (_hx, name) in enumerate(PALETTE):
+        rgb_t = (int(rgbs[i, 0]), int(rgbs[i, 1]), int(rgbs[i, 2]))
+        items.append(
+            PaletteItem(rgb=rgb_t, name=name, lab=labs[i].copy(), lch=lchs[i].copy())
+        )
+        name_of[rgb_t] = name
+    return items, name_of, labs, lchs
+
+
+def unique_colors_and_counts(
+    rgb: np.ndarray, alpha: np.ndarray
+) -> List[Tuple[Tuple[int, int, int], int]]:
+    """Return visible unique colours and their counts, sorted by count desc."""
+    mask = alpha != 0
+    if not mask.any():
+        return []
+    samples = rgb[mask]
+    dt = np.dtype([("r", "u1"), ("g", "u1"), ("b", "u1")])
+    flat = samples.view(dt).reshape(-1)
+    uniq, counts = np.unique(flat, return_counts=True)
+    rs = uniq["r"].astype(int)
+    gs = uniq["g"].astype(int)
+    bs = uniq["b"].astype(int)
+    items = [
+        ((int(rs[i]), int(gs[i]), int(bs[i])), int(counts[i])) for i in range(len(uniq))
+    ]
+    items.sort(key=lambda kv: (-kv[1], kv[0]))
+    return items
+
+
+def build_sources(
+    rgb: np.ndarray, alpha: np.ndarray
+) -> Tuple[List[SourceItem], np.ndarray, np.ndarray]:
+    """Build list of visible unique source colours and their Lab/LCh arrays."""
+    items = unique_colors_and_counts(rgb, alpha)
+    if not items:
+        return (
+            [],
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+        )
+    src_rgb = np.array([c for c, _ in items], dtype=np.uint8)
+    src_lab = srgb_to_lab_batch(src_rgb).reshape(-1, 3)
+    src_lch = lab_to_lch_batch(src_lab).reshape(-1, 3)
+    sources: List[SourceItem] = []
+    for i, ((r, g, b), n) in enumerate(items):
+        sources.append(
+            SourceItem(
+                rgb=(int(r), int(g), int(b)),
+                count=int(n),
+                lab=src_lab[i].copy(),
+                lch=src_lch[i].copy(),
+            )
+        )
+    return sources, src_lab, src_lch
+
+
+# ===================== Hue helpers =====================
+
+
+def hue_diff_deg(a: float, b: float) -> float:
+    """Absolute circular hue difference in degrees (0..180)."""
+    d = abs(a - b)
+    return d if d <= 180.0 else 360.0 - d
+
+
+# ===================== Pixel mode =====================
+
+
+def _candidate_row_for_source(
+    src_index: int,
+    src_lab_row: np.ndarray,
+    src_lch_row: np.ndarray,
     pal_lab: np.ndarray,
-    src_chroma: np.ndarray,
-    pal_chroma: np.ndarray,
+    pal_lch: np.ndarray,
+) -> Tuple[int, List[Tuple[float, int]]]:
+    """
+    For a single source unique colour, compute a cost for every palette colour.
+    Cost is CIEDE2000 + pixel-mode regularisers (hue, darkening, neutral-avoid).
+    Returns a sorted candidate list: [(cost, palette_idx), ...] asc by cost.
+    """
+    sL = float(src_lch_row[0])
+    sC = float(src_lch_row[1])
+    sh = float(src_lch_row[2])
+
+    rows: List[Tuple[float, int]] = []
+    hue_weight = min(1.0, max(0.0, sC / 25.0))  # less hue penalty if near-neutral
+
+    for j in range(pal_lab.shape[0]):
+        # Base distance
+        dE = ciede2000_pair(src_lab_row, pal_lab[j])
+
+        # Encourage closer hue if the source has chroma
+        dh = hue_diff_deg(sh, float(pal_lch[j, 2]))
+        dE += W_HUE_PX * hue_weight * (dh / HUE_PX_SCALE)
+
+        # Extra penalty for large hue mismatches on saturated sources
+        if sC >= PIXEL_SAT_C and dh > H_RING:
+            dE += W_HUE_RING * ((dh - H_RING) / H_RING)
+
+        # Avoid jumping too bright for dark sources
+        tL = float(pal_lch[j, 0])
+        if sL < L_DARK and tL > sL + L_DARK_MAX_UP:
+            dE += W_L_DARK * (tL - (sL + L_DARK_MAX_UP))
+
+        # Prefer brighter (not darker) targets a little
+        if tL < sL:
+            dE += W_BRIGHT_PX * (sL - tL)
+
+        # If the source is saturated, avoid mapping to near-neutral targets
+        tC = float(pal_lch[j, 1])
+        if sC >= PIXEL_SAT_C and tC <= NEUTRAL_C_MAX:
+            dE += NEUTRAL_PENALTY
+
+        rows.append((float(dE), j))
+
+    rows.sort(key=lambda t: t[0])
+    return src_index, rows
+
+
+def build_candidates(
+    src_lab: np.ndarray,
+    src_lch: np.ndarray,
+    pal_lab: np.ndarray,
+    pal_lch: np.ndarray,
+    sources: List[SourceItem],
+    workers: int,
+) -> Tuple[List[List[Tuple[float, int]]], Dict[Tuple[int, int], float]]:
+    """
+    For every source unique colour, precompute a sorted candidate list of palette matches.
+    Optionally parallelised across processes for speed on large unique sets.
+    Returns:
+        candidates: list of lists [(cost, palette_idx), ...] for each source index
+        cost_lookup: dict keyed by (src_idx, pal_idx) -> cost
+    """
+    n_src = src_lab.shape[0]
+    candidates: List[List[Tuple[float, int]]] = [None] * n_src  # type: ignore
+    cost_lookup: Dict[Tuple[int, int], float] = {}
+
+    if workers > 1 and n_src >= 32:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = [
+                ex.submit(
+                    _candidate_row_for_source,
+                    i,
+                    src_lab[i],
+                    src_lch[i],
+                    pal_lab,
+                    pal_lch,
+                )
+                for i in range(n_src)
+            ]
+            for fu in as_completed(futs):
+                i, rows = fu.result()
+                candidates[i] = rows
+                for cost, j in rows:
+                    cost_lookup[(i, j)] = cost
+    else:
+        for i in range(n_src):
+            _, rows = _candidate_row_for_source(
+                i, src_lab[i], src_lch[i], pal_lab, pal_lch
+            )
+            candidates[i] = rows
+            for cost, j in rows:
+                cost_lookup[(i, j)] = cost
+
+    return candidates, cost_lookup
+
+
+def _preferred_gate(src_lch_row: np.ndarray, tgt_lch_row: np.ndarray) -> bool:
+    """
+    Return True if the target passes preference gates for saturated sources:
+    - Hue within PREF_HUE_DEG
+    - Target chroma at least a fraction of source chroma
+    """
+    sC = float(src_lch_row[1])
+    if sC < 12.0:
+        return True
+    sh = float(src_lch_row[2])
+    th = float(tgt_lch_row[2])
+    tC = float(tgt_lch_row[1])
+    if hue_diff_deg(sh, th) > PREF_HUE_DEG:
+        return False
+    min_tc = max(PREF_MIN_TC_ABS, PREF_MIN_TC_REL * sC)
+    if tC < min_tc:
+        return False
+    return True
+
+
+def assign_unique(
+    sources: List[SourceItem],
+    candidates: List[List[Tuple[float, int]]],
+    cost_lookup: Dict[Tuple[int, int], float],
+    n_pal: int,
+    src_lch: np.ndarray,
+    pal_lch: np.ndarray,
+) -> Dict[int, int]:
+    """
+    Assign each visible unique source colour to one palette colour.
+    - Process sources in descending frequency.
+    - Each palette colour may be used by many sources; this assigner just finds
+      the best mapping for each source, resolving conflicts with a simple
+      iterative "evict and retry" loop (non-recursive to avoid deep recursion).
+
+    Returns: dict source_index -> palette_index
+    """
+    order = list(range(len(sources)))
+    order.sort(key=lambda i: -sources[i].count)
+
+    taken_by: Dict[int, int] = {}  # palette idx -> the source idx currently holding it
+    assigned: Dict[int, int] = {}  # source idx  -> palette idx
+    cursor: Dict[int, int] = {i: 0 for i in range(len(sources))}
+
+    def first_preferred_index(i: int) -> int | None:
+        rows = candidates[i]
+        for pos, (_c, pj) in enumerate(rows[: min(12, len(rows))]):
+            if _preferred_gate(src_lch[i], pal_lch[pj]):
+                return pos
+        return None
+
+    # Simple queue of work items; if a source is evicted, requeue it.
+    todo: List[int] = order[:]
+    tries: Dict[int, int] = {i: 0 for i in range(len(sources))}
+    MAX_TRIES = n_pal + 8  # Termination guard to prevent infinite ping-pong
+
+    while todo:
+        i = todo.pop(0)
+        rows = candidates[i]
+        if not rows:
+            continue
+
+        # Start at preferred if available, otherwise continue from last cursor
+        pref_pos = first_preferred_index(i)
+        start_pos = pref_pos if pref_pos is not None else cursor.get(i, 0)
+        pos = max(0, min(start_pos, len(rows) - 1))
+
+        src_hue = float(src_lch[i, 2])
+        src_chroma = float(src_lch[i, 1])
+
+        placed = False
+        while pos < len(rows) and tries[i] < MAX_TRIES:
+            tries[i] += 1
+            cost_i, pal_idx = rows[pos]
+
+            # If source is fairly saturated, skip non-preferred targets
+            if src_chroma >= PREF_ENFORCE_C and not _preferred_gate(
+                src_lch[i], pal_lch[pal_idx]
+            ):
+                pos += 1
+                continue
+
+            holder = taken_by.get(pal_idx)
+            if holder is None or holder == i:
+                taken_by[pal_idx] = i
+                assigned[i] = pal_idx
+                cursor[i] = pos
+                placed = True
+                break
+
+            # Compare with existing holder
+            current_cost = cost_lookup[(holder, pal_idx)]
+            better = (cost_i + SWAP_MARGIN) < current_cost
+
+            tgt_hue = float(pal_lch[pal_idx, 2])
+            d_i = hue_diff_deg(src_hue, tgt_hue)
+            d_h = hue_diff_deg(float(src_lch[holder, 2]), tgt_hue)
+            tie_hue = (
+                (not better) and (cost_i <= current_cost + 2.0) and (d_i + 6.0 < d_h)
+            )
+
+            if better or tie_hue:
+                # Evict holder, give palette colour to i
+                taken_by[pal_idx] = i
+                assigned[i] = pal_idx
+                cursor[i] = pos
+
+                # Advance holder past this pal_idx and requeue if it still has options
+                hpos = next(
+                    (
+                        k
+                        for k, (_c2, jx) in enumerate(candidates[holder])
+                        if jx == pal_idx
+                    ),
+                    cursor.get(holder, 0),
+                )
+                cursor[holder] = hpos + 1
+                if (
+                    cursor[holder] < len(candidates[holder])
+                    and tries[holder] < MAX_TRIES
+                ):
+                    todo.append(holder)
+                placed = True
+                break
+
+            pos += 1
+
+        if not placed:
+            # Fallback to very first candidate to guarantee assignment
+            assigned[i] = rows[0][1]
+            cursor[i] = 0
+
+    # Optional hue re-evaluation: if hue is far, try a close-hue candidate if cost is close
+    for i, pal_idx in list(assigned.items()):
+        src_hue = float(src_lch[i, 2])
+        tgt_hue = float(pal_lch[pal_idx, 2])
+        dh = hue_diff_deg(src_hue, tgt_hue)
+        base_cost = cost_lookup[(i, pal_idx)]
+        if dh <= H_REEVAL:
+            continue
+        for cand_cost, cand_idx in candidates[i]:
+            cand_hue = float(pal_lch[cand_idx, 2])
+            dhk = hue_diff_deg(src_hue, cand_hue)
+            if dhk <= H_REEVAL and cand_cost <= base_cost + COST_TOL_REEVAL:
+                src_L = float(src_lch[i, 0])
+                tgt_L = float(pal_lch[cand_idx, 0])
+                if src_L >= L_DARK or tgt_L <= src_L + L_DARK_MAX_UP:
+                    assigned[i] = cand_idx
+                    break
+
+    return assigned
+
+
+def apply_mapping(
+    img_rgb: np.ndarray,
+    alpha: np.ndarray,
+    mapping: Dict[Tuple[int, int, int], Tuple[int, int, int]],
 ) -> np.ndarray:
-    diff = src_lab[:, None, :] - pal_lab[None, :, :]
-    dist2 = np.einsum("knc,knc->kn", diff, diff, optimize=True)
-    mask = (src_chroma[:, None] > PHOTO_SRC_SAT_T) & (
-        pal_chroma[None, :] < PHOTO_PAL_GREY_T
-    )
-    if mask.any():
-        dist2 = np.where(mask, dist2 * (PHOTO_GREY_PENALTY**2), dist2)
-    return np.argmin(dist2, axis=1)
-
-
-def map_photo_nearest(rgb_flat: np.ndarray, palette_rgb: np.ndarray) -> np.ndarray:
-    uniq_rgb, inv = np.unique(rgb_flat, axis=0, return_inverse=True)
-    pal_lab = _srgb_to_oklab(palette_rgb)
-    pal_C = np.hypot(pal_lab[:, 1], pal_lab[:, 2])
-    src_lab = _srgb_to_oklab(uniq_rgb)
-    src_C = np.hypot(src_lab[:, 1], src_lab[:, 2])
-    idx = _nearest_indices_oklab_photo(src_lab, pal_lab, src_C, pal_C)
-    return palette_rgb[idx][inv].astype(np.uint8)
-
-
-# ---------- Pixel mode: general scoring ----------
-# Base OKLCh weights
-HUE_WEIGHT_BASE = 0.45
-CHROMA_FLOOR = 0.02
-CHROMA_RANGE = 0.12
-
-# Anti-grey for saturated sources
-SRC_SAT_T = 0.04
-PAL_GREY_T = 0.05
-GREY_PENALTY = 2.0
-
-# White / near-white guard
-WHITE_HARD_L = 0.97
-WHITE_HARD_C = 0.015
-NEARWHITE_L = 0.94
-NEARWHITE_C = 0.020
-NEARWHITE_BLOCK = 3.0
-WHITE_BONUS = 0.85
-VLGREY_BONUS = 0.92
-
-# Neutral guard (keep greys neutral)
-NEUTRAL_SRC_C_MAX = 0.06
-NEUTRAL_L_MIN = 0.35
-NEUTRAL_L_MAX = 0.92
-WARM_HUE_CENTRE = np.deg2rad(35.0)  # orange/brown region
-WARM_HUE_BW = np.deg2rad(55.0)
-WARM_MIN_C = 0.04
-NEUTRAL_TO_WARM_PEN = 3.0
-NEUTRAL_TARGET_C_MAX = 0.10  # neutrals prefer palette with low chroma
-
-# Pale-to-oversaturated clamp (generic, hue-agnostic)
-PALE_C = 0.05
-PALE_MAX_DELTA_C = 0.05
-PALE_OVER_PEN = 1.6
-
-# Hue jump limiter (generic)
-HUE_JUMP_T = np.deg2rad(30.0)
-HUE_JUMP_SLOPE = 0.5  # multiplies extra cost when |Δh| > threshold
-
-# Chroma direction consistency
-DELTA_C_TOL = 0.04
-CHROMA_BIG_JUMP_PEN = 1.5
-
-# Soft penalty for large lightness change (keeps mapping believable)
-DELTA_L_SOFT_TOL = 0.06
-DELTA_L_SOFT_WEIGHT = 0.35
-
-# Candidate set building
-GOOD_ENOUGH_RATIO = 1.06
-MAX_CANDIDATES = 22
-PEER_MIN_CANDS = 12  # for colours that touch many neighbours
-
-# Neighbour separation
-HUE_CLUSTER_BW = np.deg2rad(28.0)  # tone ladder width
-ORDER_TOL_SRC = 0.003  # OKLab L tolerances
-ORDER_TOL_TGT = 0.003
-
-
-def compute_oklab_cost(src_rgb: np.ndarray, palette_rgb: np.ndarray) -> np.ndarray:
-    pal_lab = _srgb_to_oklab(palette_rgb)
-    src_lab = _srgb_to_oklab(src_rgb)
-
-    pal_L = pal_lab[:, 0]
-    pal_a = pal_lab[:, 1]
-    pal_b = pal_lab[:, 2]
-    pal_C = np.hypot(pal_a, pal_b)
-    pal_h = np.arctan2(pal_b, pal_a)
-
-    src_L = src_lab[:, 0]
-    src_a = src_lab[:, 1]
-    src_b = src_lab[:, 2]
-    src_C = np.hypot(src_a, src_b)
-    src_h = np.arctan2(src_b, src_a)
-
-    # Base OKLCh distance
-    dL2 = (src_L[:, None] - pal_L[None, :]) ** 2
-    dC2 = (src_C[:, None] - pal_C[None, :]) ** 2
-    dh = _wrap(src_h[:, None] - pal_h[None, :])
-    hue_w = (
-        HUE_WEIGHT_BASE
-        * np.clip((src_C - CHROMA_FLOOR) / CHROMA_RANGE, 0.0, 1.0)[:, None]
-    )
-    cost = 0.6 * dL2 + 1.0 * dC2 + hue_w * (dh**2)
-
-    # Saturated sources should not fall to grey
-    to_grey = (src_C[:, None] > SRC_SAT_T) & (pal_C[None, :] < PAL_GREY_T)
-    if to_grey.any():
-        cost = np.where(to_grey, cost * (GREY_PENALTY**2), cost)
-
-    # White hard snap and near-white guard
-    # Find white index and very-light-grey mask once
-    pal_is_white = (pal_C < 0.010) & (pal_L > 0.985)
-    pal_is_vlgrey = (pal_C < 0.020) & (pal_L > 0.94)
-    # Hard snap to pure white
-    hard_white = (src_L >= WHITE_HARD_L) & (src_C <= WHITE_HARD_C)
-    if hard_white.any():
-        # make white cost minimal, others very large
-        nonwhite = ~pal_is_white[None, :]
-        cost = np.where(
-            hard_white[:, None] & nonwhite, cost * (NEARWHITE_BLOCK**4), cost
-        )
-        cost = np.where(
-            hard_white[:, None] & pal_is_white[None, :], cost * WHITE_BONUS, cost
-        )
-    # Near-white preference
-    near_white = (src_L >= NEARWHITE_L) & (src_C <= NEARWHITE_C)
-    if near_white.any():
-        coloured = ~pal_is_vlgrey[None, :]
-        cost = np.where(
-            near_white[:, None] & coloured, cost * (NEARWHITE_BLOCK**2), cost
-        )
-        cost = np.where(
-            near_white[:, None] & pal_is_white[None, :], cost * WHITE_BONUS, cost
-        )
-        cost = np.where(
-            near_white[:, None] & pal_is_vlgrey[None, :], cost * VLGREY_BONUS, cost
-        )
-
-    # Neutral greys avoid warm browns/tans and prefer low-chroma targets
-    src_is_neutral = (
-        (src_C <= NEUTRAL_SRC_C_MAX)
-        & (src_L >= NEUTRAL_L_MIN)
-        & (src_L <= NEUTRAL_L_MAX)
-    )
-    if src_is_neutral.any():
-        pal_is_warm = (np.abs(_wrap(pal_h - WARM_HUE_CENTRE)) <= WARM_HUE_BW) & (
-            pal_C >= WARM_MIN_C
-        )
-        cost = np.where(
-            src_is_neutral[:, None] & pal_is_warm[None, :],
-            cost * (NEUTRAL_TO_WARM_PEN**2),
-            cost,
-        )
-        pal_lowC = pal_C <= NEUTRAL_TARGET_C_MAX
-        cost = np.where(src_is_neutral[:, None] & pal_lowC[None, :], cost * 0.90, cost)
-
-    # Pale colours should not jump to very saturated targets
-    src_is_pale = src_C <= PALE_C
-    if src_is_pale.any():
-        too_sat = pal_C[None, :] > (src_C[:, None] + PALE_MAX_DELTA_C)
-        cost = np.where(src_is_pale[:, None] & too_sat, cost * (PALE_OVER_PEN**2), cost)
-
-    # Hue jump limiter (for large hue swings on low-chroma sources)
-    big_hue_jump = np.abs(dh) > HUE_JUMP_T
-    low_chroma_src = src_C[:, None] < 0.12
-    cost = np.where(
-        big_hue_jump & low_chroma_src,
-        cost * (1.0 + HUE_JUMP_SLOPE * (np.abs(dh) - HUE_JUMP_T)),
-        cost,
-    )
-
-    # Chroma direction consistency (discourage large ΔC)
-    deltaC = pal_C[None, :] - src_C[:, None]
-    big_up = deltaC > DELTA_C_TOL
-    big_dn = deltaC < -DELTA_C_TOL
-    cost = np.where(
-        src_is_pale[:, None] & big_up, cost * (CHROMA_BIG_JUMP_PEN**2), cost
-    )
-    cost = np.where(
-        (src_C[:, None] > 0.12) & big_dn, cost * (CHROMA_BIG_JUMP_PEN**2), cost
-    )
-
-    # Soft penalty for large lightness change (hides extreme L jumps)
-    deltaL = pal_L[None, :] - src_L[:, None]
-    soft_L = np.maximum(0.0, np.abs(deltaL) - DELTA_L_SOFT_TOL)
-    cost = cost + DELTA_L_SOFT_WEIGHT * (soft_L**2)
-
-    return cost
-
-
-def build_candidate_lists(
-    cost: np.ndarray, min_count_for_peers: Set[int] | None = None
-) -> List[np.ndarray]:
-    """Keep candidates within GOOD_ENOUGH_RATIO of the best, limited to MAX_CANDIDATES.
-    If min_count_for_peers provided, indices in that set will be extended later."""
-    K = cost.shape[0]
-    best = cost.min(axis=1)
-    order = np.argsort(cost, axis=1)
-    out: List[np.ndarray] = []
-    for i in range(K):
-        r = order[i]
-        r = r[cost[i, r] <= best[i] * GOOD_ENOUGH_RATIO]
-        if r.size == 0:
-            r = order[i, :1]
-        out.append(r[:MAX_CANDIDATES])
+    """Replace colours per mapping dict for visible pixels, leaving others and alpha as-is."""
+    out = img_rgb.copy()
+    h, w, _ = out.shape
+    for y in range(h):
+        for x in range(w):
+            if alpha[y, x] == 0:
+                continue
+            key = (int(out[y, x, 0]), int(out[y, x, 1]), int(out[y, x, 2]))
+            replacement = mapping.get(key)
+            target = replacement if replacement is not None else key
+            out[y, x, 0] = np.uint8(target[0])
+            out[y, x, 1] = np.uint8(target[1])
+            out[y, x, 2] = np.uint8(target[2])
     return out
 
 
-# ---------- Neighbour graph (8-neighbour) ----------
-ADJ_MAX_UNIQUES = 40000
+# ===================== Photo helpers =====================
 
 
-def _peer_sets_from_uimg(uimg: np.ndarray) -> List[Set[int]]:
-    H, W = uimg.shape
-    valid = uimg >= 0
-    if not np.any(valid):
-        return [set()]
-    K = int(uimg[valid].max()) + 1
-    if K <= 0:
-        return [set()]
-    if K > ADJ_MAX_UNIQUES:
-        return [set() for _ in range(K)]
-
-    counts: Dict[tuple[int, int], int] = {}
-    deg = np.zeros(K, dtype=np.int64)
-
-    def add_pairs(a: np.ndarray, b: np.ndarray) -> None:
-        m = (a >= 0) & (b >= 0) & (a != b)
-        if not np.any(m):
-            return
-        ia = a[m].astype(np.int32)
-        ib = b[m].astype(np.int32)
-        lo = np.minimum(ia, ib)
-        hi = np.maximum(ia, ib)
-        pairs = np.stack([lo, hi], axis=1)
-        uniq, cnt = np.unique(pairs, axis=0, return_counts=True)
-        for (i, j), c in zip(uniq, cnt):
-            key = (int(i), int(j))
-            counts[key] = counts.get(key, 0) + int(c)
-            deg[int(i)] += int(c)
-            deg[int(j)] += int(c)
-
-    add_pairs(uimg[:, :-1], uimg[:, 1:])  # right
-    add_pairs(uimg[:-1, :], uimg[1:, :])  # down
-    add_pairs(uimg[:-1, :-1], uimg[1:, 1:])  # diag down-right
-    add_pairs(uimg[:-1, 1:], uimg[1:, :-1])  # diag down-left
-
-    peers: List[Set[int]] = [set() for _ in range(K)]
-    for (i, j), c in counts.items():
-        if c <= 0:
-            continue
-        # connect both directions
-        peers[i].add(j)
-        peers[j].add(i)
-    return peers
+def compute_L_image(rgb: np.ndarray) -> np.ndarray:
+    """Compute CIE L (per pixel) from sRGB image."""
+    arr = rgb.astype(np.float32) / 255.0
+    arr_lin = _srgb_to_linear(arr)
+    Y = (
+        arr_lin[..., 0] * 0.2126729
+        + arr_lin[..., 1] * 0.7151522
+        + arr_lin[..., 2] * 0.0721750
+    )
+    fy = np.where(Y > 0.008856, np.cbrt(Y), 7.787 * Y + 16.0 / 116.0)
+    L = 116.0 * fy - 16.0
+    return L.astype(np.float32)
 
 
-# ---------- Frequency-first assignment with peer awareness ----------
-def _topk_max_matching_iter(
-    top_idx: np.ndarray, cands: List[np.ndarray], num_pal: int, peers: List[Set[int]]
-) -> tuple[np.ndarray, np.ndarray]:
+def box_blur_2d(arr: np.ndarray, radius: int) -> np.ndarray:
+    """Fast box blur using summed-area table (integral image)."""
+    if radius <= 0:
+        return arr.astype(np.float32)
+    arr = arr.astype(np.float32)
+    H, W = arr.shape
+    ii = np.cumsum(np.cumsum(arr, axis=0), axis=1)
+    ii_pad = np.zeros((H + 1, W + 1), dtype=np.float32)
+    ii_pad[1:, 1:] = ii
+    ys = np.arange(H)[:, None]
+    xs = np.arange(W)[None, :]
+    y1 = np.clip(ys - radius, 0, H - 1)
+    y2 = np.clip(ys + radius, 0, H - 1)
+    x1 = np.clip(xs - radius, 0, W - 1)
+    x2 = np.clip(xs + radius, 0, W - 1)
+    s = (
+        ii_pad[y2 + 1, x2 + 1]
+        - ii_pad[y1, x2 + 1]
+        - ii_pad[y2 + 1, x1]
+        + ii_pad[y1, x1]
+    )
+    area = (y2 - y1 + 1) * (x2 - x1 + 1)
+    return (s / area).astype(np.float32)
+
+
+def grad_mag(L_img: np.ndarray) -> np.ndarray:
+    """Simple 3x3-ish gradient magnitude (Manhattan) blurred a bit to stabilise."""
+    H, W = L_img.shape
+    gx = np.zeros_like(L_img, dtype=np.float32)
+    gy = np.zeros_like(L_img, dtype=np.float32)
+    gx[:, 1:] = np.abs(L_img[:, 1:] - L_img[:, :-1])
+    gy[1:, :] = np.abs(L_img[1:, :] - L_img[:-1, :])
+    g = gx + gy
+    return box_blur_2d(g, 1)
+
+
+def estimate_ab_bias(lab_img: np.ndarray, alpha: np.ndarray) -> Tuple[float, float]:
     """
-    Iterative Kuhn-style augmenting paths (no recursion).
-    Avoid assigning a palette already owned by a peer if an augmenting path exists.
+    Estimate global colour drift in a/b by averaging near-neutral pixels.
+    This helps keep greys neutral in photo mode.
     """
-    owner = np.full(num_pal, -1, dtype=np.int32)
-    chosen = np.full(len(cands), -1, dtype=np.int32)
-
-    for i_val in top_idx:
-        src = int(i_val)
-        seen = np.zeros(num_pal, dtype=bool)
-        parent = np.full(
-            num_pal, -1, dtype=np.int32
-        )  # remember which source led to palette
-        queue: List[int] = []
-
-        # seed with all allowed candidates not owned by peers
-        for pj in cands[src]:
-            j = int(pj)
-            if owner[j] != -1 and owner[j] in peers[src]:
-                continue
-            if not seen[j]:
-                seen[j] = True
-                parent[j] = -2  # root marker
-                queue.append(j)
-
-        aug_end = -1
-        while queue:
-            j = queue.pop(0)
-            if owner[j] == -1:
-                aug_end = j
-                break
-            # explore the owner's alternative candidates
-            other = int(owner[j])
-            for pj2 in cands[other]:
-                k = int(pj2)
-                if owner[k] != -1 and owner[k] in peers[other]:
-                    continue
-                if not seen[k]:
-                    seen[k] = True
-                    parent[k] = j
-                    queue.append(k)
-
-        # build augmenting path if found
-        if aug_end != -1:
-            j = aug_end
-            cur_src = src
-            while True:
-                prev_owner = owner[j]
-                owner[j] = cur_src
-                chosen[cur_src] = j
-                if parent[j] == -2:
-                    break
-                j_prev = parent[j]
-                cur_src = int(owner[j_prev])
-                j = j_prev
-
-    return owner, chosen
+    L = lab_img[..., 0]
+    a = lab_img[..., 1]
+    b = lab_img[..., 2]
+    C = np.hypot(a, b)
+    mask = (
+        (alpha != 0)
+        & (C <= NEUTRAL_EST_C)
+        & (L >= NEUTRAL_EST_LMIN)
+        & (L <= NEUTRAL_EST_LMAX)
+    )
+    if not mask.any():
+        return (0.0, 0.0)
+    a_mean = float(a[mask].mean())
+    b_mean = float(b[mask].mean())
+    return (AB_BIAS_GAIN * a_mean, AB_BIAS_GAIN * b_mean)
 
 
-# ---------- Neighbour-aware greedy + post-passes ----------
-def map_with_neighbours(
-    uniq_rgb: np.ndarray,
-    inv: np.ndarray,
-    counts: np.ndarray,
-    palette_rgb: np.ndarray,
-    uimg: np.ndarray,  # 2D map of unique indices (-1 for transparent)
+def prefilter_topk(
+    src_lab_row: np.ndarray, pal_lab_mat: np.ndarray, k: int
 ) -> np.ndarray:
-    K, Np = uniq_rgb.shape[0], palette_rgb.shape[0]
-
-    # Score all (source×palette)
-    cost = compute_oklab_cost(uniq_rgb, palette_rgb)
-
-    # Candidate lists
-    cands = build_candidate_lists(cost)
-
-    # Peer sets (8-neighbour)
-    peers = _peer_sets_from_uimg(uimg)
-
-    # Expand candidate lists for peer-heavy colours
-    order_full = [np.argsort(cost[i]) for i in range(K)]
-    for i in range(K):
-        if peers[i] and cands[i].size < PEER_MIN_CANDS:
-            cands[i] = order_full[i][: max(PEER_MIN_CANDS, cands[i].size)]
-
-    # Frequency-first ordering
-    order_src = np.argsort(-counts)
-    topM = min(Np, K)
-    top_idx = order_src[:topM]
-
-    # Max-matching for the top block with peer awareness
-    owner, chosen_top = _topk_max_matching_iter(top_idx, cands, Np, peers)
-
-    used = set(int(j) for j in owner if int(j) != -1)
-    choice = np.full(K, -1, dtype=np.int32)
-    for i_val in top_idx:
-        ii = int(i_val)
-        cj = int(chosen_top[ii])
-        if cj != -1:
-            choice[ii] = cj
-
-    # Greedy for the rest, avoid neighbour collisions where possible
-    for i_val in order_src:
-        ii = int(i_val)
-        if choice[ii] != -1:
-            continue
-        row = cands[ii]
-        if row.size == 0:
-            row = np.argsort(cost[ii])[:1]
-
-        peer_used: Set[int] = {int(choice[j]) for j in peers[ii] if 0 <= choice[j] < Np}
-
-        # 1) first free non-neighbour palette
-        picked = None
-        for jv in row:
-            j = int(jv)
-            if j not in used and j not in peer_used:
-                picked = j
-                break
-        if picked is not None:
-            choice[ii] = picked
-            used.add(picked)
-            continue
-
-        # 2) any non-neighbour (even if reused)
-        for jv in row:
-            j = int(jv)
-            if j not in peer_used:
-                choice[ii] = j
-                used.add(j)
-                break
-        if choice[ii] != -1:
-            continue
-
-        # 3) any free
-        for jv in row:
-            j = int(jv)
-            if j not in used:
-                choice[ii] = j
-                used.add(j)
-                break
-        if choice[ii] != -1:
-            continue
-
-        # 4) best
-        choice[ii] = int(row[0])
-        used.add(int(row[0]))
-
-    # --- Post-pass A: split neighbour collisions with tone ladder ---
-    pal_lab = _srgb_to_oklab(palette_rgb)
-    pal_L = pal_lab[:, 0]
-    pal_a = pal_lab[:, 1]
-    pal_b = pal_lab[:, 2]
-    pal_C = np.hypot(pal_a, pal_b)
-    pal_h = np.arctan2(pal_b, pal_a)
-
-    src_L = _srgb_to_oklab(uniq_rgb)[:, 0]
-    src_C = np.hypot(_srgb_to_oklab(uniq_rgb)[:, 1], _srgb_to_oklab(uniq_rgb)[:, 2])
-
-    for ii in range(K):
-        pi = int(choice[ii])
-        if pi < 0:
-            continue
-        for jj in peers[ii]:
-            if jj <= ii:
-                continue
-            pj = int(choice[jj])
-            if pj < 0:
-                continue
-            if pj != pi:
-                continue  # no collision
-
-            # Move the less frequent to a nearby tone in the same hue cluster if possible
-            move = ii if counts[ii] <= counts[jj] else jj
-            keep = jj if move == ii else ii
-            keep_h = pal_h[int(choice[keep])]
-            keep_L = pal_L[int(choice[keep])]
-            # tone ladder: same-hue cluster
-            cluster = np.where(np.abs(_wrap(pal_h - keep_h)) <= HUE_CLUSTER_BW)[0]
-            # Prefer entries that keep local order: darker if source is darker, else lighter
-            want_darker = src_L[move] < src_L[keep] - ORDER_TOL_SRC
-            cand_list = cands[move]
-            # iterate candidates in order, filter to cluster and not equal to keep
-            new_pick = None
-            for jv in cand_list:
-                j = int(jv)
-                if j == int(choice[keep]):
-                    continue
-                if j not in cluster:
-                    continue
-                # lightness order intention
-                if want_darker and pal_L[j] > keep_L + ORDER_TOL_TGT:
-                    continue
-                if (not want_darker) and pal_L[j] < keep_L - ORDER_TOL_TGT:
-                    continue
-                new_pick = j
-                break
-            # fallback: nearest in cluster even if order not perfect
-            if new_pick is None:
-                for jv in cand_list:
-                    j = int(jv)
-                    if j == int(choice[keep]):
-                        continue
-                    if j in cluster:
-                        new_pick = j
-                        break
-            if new_pick is not None:
-                choice[move] = new_pick
-
-    # --- Post-pass B: preserve neighbour gradient signs (L and C) ---
-    for ii in range(K):
-        pi = int(choice[ii])
-        if pi < 0:
-            continue
-        for jj in peers[ii]:
-            if jj <= ii:
-                continue
-            pj = int(choice[jj])
-            if pj < 0:
-                continue
-            # Source relations
-            dL_src = src_L[ii] - src_L[jj]
-            dC_src = src_C[ii] - src_C[jj]
-            # Target relations
-            dL_tgt = pal_L[pi] - pal_L[pj]
-            dC_tgt = pal_C[pi] - pal_C[pj]
-
-            # If signs flip materially, try to nudge the less frequent to restore sign
-            need_fix_L = (abs(dL_src) > ORDER_TOL_SRC) and (
-                np.sign(dL_src) != np.sign(dL_tgt)
-            )
-            need_fix_C = (abs(dC_src) > 0.01) and (np.sign(dC_src) != np.sign(dC_tgt))
-
-            if need_fix_L or need_fix_C:
-                move = ii if counts[ii] <= counts[jj] else jj
-                keep = jj if move == ii else ii
-                target_L = pal_L[int(choice[keep])] + (
-                    ORDER_TOL_TGT * (-1 if dL_src > 0 else 1)
-                )
-                target_C = pal_C[int(choice[keep])] + (0.01 * (-1 if dC_src > 0 else 1))
-
-                # Try to find a candidate for 'move' that restores the sign(s)
-                new_pick = None
-                for jv in cands[move]:
-                    j = int(jv)
-                    if j == int(choice[keep]):
-                        continue
-                    okL = True
-                    okC = True
-                    if need_fix_L:
-                        okL = (dL_src > 0 and pal_L[j] > target_L - ORDER_TOL_TGT) or (
-                            dL_src < 0 and pal_L[j] < target_L + ORDER_TOL_TGT
-                        )
-                    if need_fix_C:
-                        okC = (dC_src > 0 and pal_C[j] > target_C - 0.005) or (
-                            dC_src < 0 and pal_C[j] < target_C + 0.005
-                        )
-                    if okL and okC:
-                        new_pick = j
-                        break
-                if new_pick is not None:
-                    choice[move] = new_pick
-
-    return palette_rgb[choice][inv].astype(np.uint8)
+    """
+    Quick prefilter: pick top-k candidates by squared Euclidean distance in Lab.
+    This speeds up the more expensive cost calculation.
+    """
+    diff = pal_lab_mat - src_lab_row
+    de2 = (diff * diff).sum(axis=1)
+    if k >= de2.shape[0]:
+        return np.argsort(de2)
+    idx = np.argpartition(de2, k)[:k]
+    return idx[np.argsort(de2[idx])]
 
 
-# ---------- IO / reporting ----------
-def downscale_to_height(img: Image.Image, target_h: int) -> Image.Image:
-    if target_h <= 0:
-        return img
-    w, h = img.width, img.height
-    if target_h >= h:
-        return img
-    new_w = max(1, round(w * target_h / h))
-    return img.resize((new_w, target_h), resample=Image.Resampling.BOX)
+def photo_cost_components(
+    src_lab_row: np.ndarray,
+    src_lch_row: np.ndarray,
+    L_local: float,
+    w_local_eff: float,
+    tgt_lch_rows: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute additional costs for photo mode for a set of target palette LCh rows:
+    - Keep local contrast around L_local.
+    - Soft hue and chroma matching.
+    - In shadows, allow a little hue shift and chroma increase for legibility.
+    - Penalise sending saturated sources to neutral targets.
+    Returns (base_cost_array, target_chroma_array).
+    """
+    sL = src_lch_row[0]
+    sC = src_lch_row[1]
+    sh = src_lch_row[2]
+    tL = tgt_lch_rows[:, 0]
+    tC = tgt_lch_rows[:, 1]
+    th = tgt_lch_rows[:, 2]
 
+    base = np.zeros_like(tL, dtype=np.float32)
 
-def print_usage_report(img: Image.Image) -> None:
-    arr = np.array(img, dtype=np.uint8)
-    if img.mode == "RGBA":
-        mask = arr[:, :, 3] > 0
-        if not mask.any():
-            print("Colours used: none (fully transparent)")
-            return
-        cols = arr[:, :, :3][mask].reshape(-1, 3)
-    else:
-        cols = arr.reshape(-1, 3)
+    # Keep local contrast around L_local
+    base += W_LOCAL_BASE * w_local_eff * np.abs((tL - L_local) - (sL - L_local))
 
-    uniq, counts = np.unique(cols, axis=0, return_counts=True)
+    # Do not flatten contrast too much (allow small margin)
+    d_s = abs(sL - L_local)
+    d_t = np.abs(tL - L_local)
+    base += np.where(
+        d_t + CONTRAST_MARGIN < d_s, W_CONTRAST * (d_s - d_t - CONTRAST_MARGIN), 0.0
+    )
 
-    def _hx(row: np.ndarray) -> str:
-        return f"#{int(row[0]):02x}{int(row[1]):02x}{int(row[2]):02x}".lower()
+    # Hue guidance (weigh less when source is near-neutral)
+    hue_w = min(1.0, sC / 40.0)
+    base += (
+        W_HUE * hue_w * (np.minimum(np.abs(th - sh), 360.0 - np.abs(th - sh)) / 180.0)
+    )
 
-    items = [
-        (int(cnt), _hx(rgb), HEX_TO_NAME.get(_hx(rgb), "Unknown"))
-        for rgb, cnt in zip(uniq, counts)
-    ]
-    items.sort(key=lambda t: t[0], reverse=True)
-    print("Colours used:")
-    for cnt, hx, name in items:
-        print(f"{hx}  {name}: {cnt}")
+    # Chroma guidance
+    base += W_CHROMA * np.abs(tC - sC)
 
-
-# ---------- Pipeline ----------
-def process(
-    input_path: str,
-    output_path: str | None,
-    target_height: int,
-    mode: str,
-    auto_photo_threshold: int,
-) -> None:
-    palette_rgb = build_palette_rgb()
-
-    im = Image.open(input_path).convert("RGBA")
-    im = downscale_to_height(im, target_height)
-    arr = np.array(im, dtype=np.uint8)
-    H, W = arr.shape[:2]
-
-    rgb_all = arr[:, :, :3].reshape(-1, 3)
-    alpha = arr[:, :, 3].reshape(-1)
-    vis_mask = alpha > 0
-
-    chosen_mode = mode
-    if mode == "auto":
-        uniq_vis_est = (
-            np.unique(rgb_all[vis_mask], axis=0).shape[0] if vis_mask.any() else 0
+    # Shadow handling: allow some hue shift and chroma bump to keep details readable
+    if sL < 40.0:
+        shadow_factor = (SHADOW_L - sL) / SHADOW_L
+        hue_dist = np.minimum(np.abs(th - sh), 360.0 - np.abs(th - sh)) / 180.0
+        chroma_up = np.maximum(0.0, tC - sC)
+        base += shadow_factor * (
+            W_SHADOW_HUE * hue_dist + W_SHADOW_CHROMA_UP * chroma_up
         )
-        chosen_mode = "photo" if uniq_vis_est > auto_photo_threshold else "pixel"
 
-    rgb_out = rgb_all.copy()
-    if vis_mask.any():
-        if chosen_mode == "pixel":
-            # uniques for visible pixels
-            uniq_rgb, inv, counts = np.unique(
-                rgb_all[vis_mask], axis=0, return_inverse=True, return_counts=True
+    # If source is saturated, avoid mapping to neutral targets
+    if sC >= CHROMA_SRC_MIN:
+        base += np.where(
+            tC <= NEUTRAL_C_MAX, NEUTRAL_PENALTY + 0.02 * np.maximum(0.0, sC - tC), 0.0
+        )
+
+    return base, tC
+
+
+def ciede2000_vec(src_lab_row: np.ndarray, cand_lab_rows: np.ndarray) -> np.ndarray:
+    """Vectorised CIEDE2000 between a single src_lab_row and many candidate rows."""
+    L1 = src_lab_row[0]
+    a1 = src_lab_row[1]
+    b1 = src_lab_row[2]
+    L2 = cand_lab_rows[:, 0]
+    a2 = cand_lab_rows[:, 1]
+    b2 = cand_lab_rows[:, 2]
+
+    C1 = np.hypot(a1, b1)
+    C2 = np.hypot(a2, b2)
+    Cm = 0.5 * (C1 + C2)
+    G = 0.5 * (1 - np.sqrt((Cm**7) / (Cm**7 + 25**7)))
+    a1p = (1 + G) * a1
+    a2p = (1 + G) * a2
+    C1p = np.hypot(a1p, b1)
+    C2p = np.hypot(a2p, b2)
+
+    h1p = (np.degrees(np.atan2(b1, a1p)) + 360.0) % 360.0
+    h2p = (np.degrees(np.atan2(b2, a2p)) + 360.0) % 360.0
+
+    dLp = L2 - L1
+    dhp = h2p - h1p
+    dhp = np.where((C1p * C2p) == 0, 0.0, dhp)
+    dhp = np.where(dhp > 180.0, dhp - 360.0, dhp)
+    dhp = np.where(dhp < -180.0, dhp + 360.0, dhp)
+    dHp = 2.0 * np.sqrt(C1p * C2p) * np.sin(np.radians(dhp) / 2.0)
+
+    Lpm = 0.5 * (L1 + L2)
+    Cpm = 0.5 * (C1p + C2p)
+    hpm = np.where(
+        (C1p * C2p) == 0,
+        h1p + h2p,
+        np.where(
+            np.abs(h1p - h2p) <= 180.0,
+            0.5 * (h1p + h2p),
+            np.where(
+                (h1p + h2p) < 360.0,
+                0.5 * (h1p + h2p + 360.0),
+                0.5 * (h1p + h2p - 360.0),
+            ),
+        ),
+    )
+    T = (
+        1
+        - 0.17 * np.cos(np.radians(hpm - 30.0))
+        + 0.24 * np.cos(np.radians(2.0 * hpm))
+        + 0.32 * np.cos(np.radians(3.0 * hpm + 6.0))
+        - 0.20 * np.cos(np.radians(4.0 * hpm - 63.0))
+    )
+    d_ro = 30.0 * np.exp(-(((hpm - 275.0) / 25.0) ** 2.0))
+    Rc = 2.0 * np.sqrt((Cpm**7) / (Cpm**7 + 25**7))
+    Sl = 1.0 + (0.015 * (Lpm - 50.0) ** 2) / np.sqrt(20.0 + (Lpm - 50.0) ** 2)
+    Sc = 1.0 + 0.045 * Cpm
+    Sh = 1.0 + 0.015 * Cpm * T
+    Rt = -np.sin(np.radians(2.0 * d_ro)) * Rc
+    dCp = C2p - C1p
+    return np.sqrt(
+        (dLp / Sl) ** 2
+        + (dCp / Sc) ** 2
+        + (dHp / Sh) ** 2
+        + Rt * (dCp / Sc) * (dHp / Sh)
+    )
+
+
+def nearest_palette_idx_photo_lab_prefilter_vec(
+    src_lab_row: np.ndarray,
+    src_lch_row: np.ndarray,
+    L_local: float,
+    w_local_eff: float,
+    pal_lab_mat: np.ndarray,
+    pal_lch_mat: np.ndarray,
+    near_extreme_neutral: bool,
+    k: int,
+) -> int:
+    """
+    Photo-mode: choose best palette index for one pixel.
+    Steps:
+      1) Prefilter to k nearest by Lab Euclidean distance (fast).
+      2) Compute CIEDE2000 + photo costs on that subset.
+      3) If pixel is near extreme neutral, force choosing from neutral palette colours.
+    """
+    idxs = prefilter_topk(src_lab_row, pal_lab_mat, k)
+    cand_lab = pal_lab_mat[idxs]
+    cand_lch = pal_lch_mat[idxs]
+
+    dE = ciede2000_vec(src_lab_row, cand_lab)
+    comp_base, tC = photo_cost_components(
+        src_lab_row, src_lch_row, L_local, w_local_eff, cand_lch
+    )
+    cost = dE + comp_base
+
+    if near_extreme_neutral:
+        # If the source pixel is near black or white and nearly neutral,
+        # force neutral outputs (others get a huge penalty).
+        cost = np.where(tC > NEUTRAL_C_MAX, cost + 1e6, cost)
+
+    return int(idxs[int(np.argmin(cost))])
+
+
+# ===================== Photo mode =====================
+
+
+def dither_photo(
+    img_rgb: np.ndarray,
+    alpha: np.ndarray,
+    palette: List[PaletteItem],
+    pal_lab_mat: np.ndarray,
+    pal_lch_mat: np.ndarray,
+) -> np.ndarray:
+    """
+    Photo-like rendering: per-pixel palette selection guided by local contrast,
+    with a small Floyd-Steinberg error diffusion on L only to reduce banding.
+
+    Steps:
+      - Convert to Lab and compute local L reference and simple gradient magnitude.
+      - Estimate global a/b bias from near-neutrals and subtract to keep greys clean.
+      - For each visible pixel:
+          * Adjusted Lab by removing a/b bias.
+          * Compute LCh for source pixel.
+          * Choose best palette via prefiltered CIEDE2000 + photo costs.
+          * Place chosen RGB.
+          * Diffuse a small portion of L error to neighbours.
+    """
+    H, W, _ = img_rgb.shape
+    out = np.zeros_like(img_rgb, dtype=np.uint8)
+
+    src_lab_img = srgb_to_lab_batch(img_rgb).reshape(H, W, 3)
+    L_src = src_lab_img[..., 0]
+    L_local = box_blur_2d(L_src, BLUR_RADIUS)
+    grad = grad_mag(L_src)
+    ab_bias = estimate_ab_bias(src_lab_img, alpha)
+
+    errL = np.zeros((H, W), dtype=np.float32)  # L error buffer for diffusion
+
+    for y in range(H):
+        serp_left = y % 2 == 0
+        xs = range(W) if serp_left else range(W - 1, -1, -1)
+
+        # Classic Floyd-Steinberg neighbours (serpentine)
+        if serp_left:
+            neighbors: Tuple[Tuple[int, int, float], ...] = (
+                (1, 0, 7 / 16),
+                (-1, 1, 3 / 16),
+                (0, 1, 5 / 16),
+                (1, 1, 1 / 16),
+            )
+        else:
+            neighbors = (
+                (-1, 0, 7 / 16),
+                (1, 1, 3 / 16),
+                (0, 1, 5 / 16),
+                (-1, 1, 1 / 16),
             )
 
-            # 2D map of unique indices (-1 elsewhere) for neighbour discovery
-            uimg = np.full((H, W), -1, dtype=np.int32)
-            flat_vis = np.flatnonzero(vis_mask.reshape(H * W))
-            ys = flat_vis // W
-            xs = flat_vis % W
-            uimg[ys, xs] = inv
+        for x in xs:
+            if alpha[y, x] == 0:
+                continue
 
-            mapped = map_with_neighbours(uniq_rgb, inv, counts, palette_rgb, uimg)
-        else:
-            mapped = map_photo_nearest(rgb_all[vis_mask], palette_rgb)
+            # Weight local-contrast constraint less at edges
+            wloc = max(0.2, 1.0 - (grad[y, x] / GRAD_K))
 
-        rgb_out[vis_mask] = mapped
+            # Apply L error diffusion and subtract global a/b bias
+            sL = float(src_lab_img[y, x, 0]) + float(errL[y, x])
+            sa = float(src_lab_img[y, x, 1]) - ab_bias[0]
+            sb = float(src_lab_img[y, x, 2]) - ab_bias[1]
+            src_lab_adj = np.array([sL, sa, sb], dtype=np.float32)
 
-    out = np.dstack([rgb_out.reshape(H, W, 3), alpha.reshape(H, W)]).astype(np.uint8)
-    out_img = Image.fromarray(out, mode="RGBA")
+            # Compute source LCh
+            C = float(math.hypot(src_lab_adj[1], src_lab_adj[2]))
+            h = (
+                math.degrees(math.atan2(src_lab_adj[2], src_lab_adj[1])) + 360.0
+            ) % 360.0
+            src_lch_adj = np.array([src_lab_adj[0], C, h], dtype=np.float32)
 
-    if not output_path:
-        out_path = Path(input_path).with_name(f"{Path(input_path).stem}_wplace.png")
-    else:
-        out_path = Path(output_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_img.save(out_path, format="PNG", optimize=False)
+            # Special casing for near-perfect neutrals near extremes
+            near_extreme_neutral = (C <= NEAR_NEUTRAL_C) and (
+                sL <= NEAR_BLACK_L or sL >= NEAR_WHITE_L
+            )
 
-    print(f"Mode: {chosen_mode}")
-    print(f"Wrote {out_path} | size={W}x{H} | palette_size={len(PALETTE_ENTRIES)}")
-    print_usage_report(out_img)
+            # Pick best palette colour
+            j = nearest_palette_idx_photo_lab_prefilter_vec(
+                src_lab_adj,
+                src_lch_adj,
+                float(L_local[y, x]),
+                W_LOCAL_BASE * wloc,
+                pal_lab_mat,
+                pal_lch_mat,
+                near_extreme_neutral,
+                PHOTO_TOPK,
+            )
+
+            r, g, b = palette[j].rgb
+            out[y, x, 0] = r
+            out[y, x, 1] = g
+            out[y, x, 2] = b
+
+            # Diffuse small portion of L error to neighbours
+            tgt_L = float(pal_lch_mat[j, 0])
+            eL = max(-EL_CLAMP, min(EL_CLAMP, sL - tgt_L))
+            for dx, dy, w in neighbors:
+                nx, ny = x + dx, y + dy
+                if 0 <= ny < H and 0 <= nx < W and alpha[ny, nx] != 0:
+                    errL[ny, nx] += eL * w
+
+    return out
 
 
-# ---------- CLI ----------
+# ===================== Palette enforcement =====================
+
+
+def _palette_set(palette: List[PaletteItem]) -> set[Tuple[int, int, int]]:
+    return {p.rgb for p in palette}
+
+
+def is_palette_only(
+    img_rgb: np.ndarray, alpha: np.ndarray, pal_set: set[Tuple[int, int, int]]
+) -> bool:
+    """Return True if all visible pixels are in the palette set."""
+    h, w, _ = img_rgb.shape
+    for y in range(h):
+        for x in range(w):
+            if alpha[y, x] == 0:
+                continue
+            t = (int(img_rgb[y, x, 0]), int(img_rgb[y, x, 1]), int(img_rgb[y, x, 2]))
+            if t not in pal_set:
+                return False
+    return True
+
+
+def lock_to_palette_by_uniques(
+    out_rgb: np.ndarray,
+    alpha: np.ndarray,
+    palette: List[PaletteItem],
+    pal_lab_mat: np.ndarray,
+) -> np.ndarray:
+    """
+    If any colours are not in the palette (should not happen often), replace them
+    by finding the nearest palette colour in Lab using a unique-colour pass.
+    """
+    H, W, _ = out_rgb.shape
+    pal_set = _palette_set(palette)
+    mask = alpha != 0
+    samples = out_rgb[mask]
+    if samples.size == 0:
+        return out_rgb
+
+    dt = np.dtype([("r", "u1"), ("g", "u1"), ("b", "u1")])
+    flat = samples.view(dt).reshape(-1)
+    uniq = np.unique(flat)
+    rs = uniq["r"].astype(int)
+    gs = uniq["g"].astype(int)
+    bs = uniq["b"].astype(int)
+
+    off: List[Tuple[int, int, int]] = []
+    for i in range(len(uniq)):
+        t = (int(rs[i]), int(gs[i]), int(bs[i]))
+        if t not in pal_set:
+            off.append(t)
+    if not off:
+        return out_rgb
+
+    off_np = np.array(off, dtype=np.uint8)
+    off_lab = srgb_to_lab_batch(off_np).reshape(-1, 3)
+
+    mapping: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
+    pal_rgb_arr: np.ndarray = np.array([p.rgb for p in palette], dtype=np.uint8)
+
+    # Simple nearest in Lab for each off-palette unique
+    for i in range(off_lab.shape[0]):
+        s_lab = off_lab[i]
+        diff = pal_lab_mat - s_lab
+        de2 = (diff * diff).sum(axis=1)
+        best = int(np.argmin(de2))
+        r = int(pal_rgb_arr[best, 0])
+        g = int(pal_rgb_arr[best, 1])
+        b = int(pal_rgb_arr[best, 2])
+        key = (int(off_np[i, 0]), int(off_np[i, 1]), int(off_np[i, 2]))
+        mapping[key] = (r, g, b)
+
+    out = out_rgb.copy()
+    for y in range(H):
+        for x in range(W):
+            if alpha[y, x] == 0:
+                continue
+            t = (int(out[y, x, 0]), int(out[y, x, 1]), int(out[y, x, 2]))
+            rep = mapping.get(t)
+            if rep is not None:
+                out[y, x, 0], out[y, x, 1], out[y, x, 2] = rep
+    return out
+
+
+def lock_to_palette_per_pixel(
+    out_rgb: np.ndarray,
+    alpha: np.ndarray,
+    palette: List[PaletteItem],
+) -> np.ndarray:
+    """
+    Final safety pass: per-pixel nearest in RGB to the palette.
+    Chunked to keep memory reasonable.
+    """
+    H, W, _ = out_rgb.shape
+    out = out_rgb.copy()
+    mask = alpha != 0
+    if not mask.any():
+        return out
+    pal_rgb = np.array([p.rgb for p in palette], dtype=np.int16)
+    coords = np.argwhere(mask)
+    chunk = 200_000
+    for i in range(0, coords.shape[0], chunk):
+        sl = coords[i : i + chunk]
+        pts = out[sl[:, 0], sl[:, 1]].astype(np.int16)
+        diff = pts[:, None, :] - pal_rgb[None, :, :]
+        de2 = np.sum(diff * diff, axis=2)
+        idx = np.argmin(de2, axis=1)
+        mapped = pal_rgb[idx].astype(np.uint8)
+        out[sl[:, 0], sl[:, 1]] = mapped
+    return out
+
+
+# ===================== Reporting =====================
+
+
+def print_color_usage(
+    out_rgb: np.ndarray, alpha: np.ndarray, name_of: Dict[Tuple[int, int, int], str]
+) -> None:
+    """Print a count of how many times each palette colour appears in the visible output."""
+    h, w, _ = out_rgb.shape
+    cnt: Counter[Tuple[int, int, int]] = Counter()
+    for y in range(h):
+        for x in range(w):
+            if alpha[y, x] == 0:
+                continue
+            key = (int(out_rgb[y, x, 0]), int(out_rgb[y, x, 1]), int(out_rgb[y, x, 2]))
+            cnt[key] += 1
+    items = sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))
+    print("Colours used:")
+    for (r, g, b), n in items:
+        hx = rgb_to_hex((r, g, b))
+        nm = name_of.get((r, g, b), "")
+        label = f"  {hx}  {nm}: {n}" if nm else f"  {hx}: {n}"
+        print(label)
+
+
+def count_off_palette_pixels(
+    img_rgb: np.ndarray, alpha: np.ndarray, palette: List[PaletteItem]
+) -> int:
+    """Count how many visible pixels are not exact palette colours."""
+    pal_set = _palette_set(palette)
+    h, w, _ = img_rgb.shape
+    c = 0
+    for y in range(h):
+        for x in range(w):
+            if alpha[y, x] == 0:
+                continue
+            t = (int(img_rgb[y, x, 0]), int(img_rgb[y, x, 1]), int(img_rgb[y, x, 2]))
+            if t not in pal_set:
+                c += 1
+    return c
+
+
+# ===================== Auto mode heuristic =====================
+
+
+def decide_auto_mode(img_rgb: np.ndarray, alpha: np.ndarray) -> str:
+    """
+    Pick 'pixel' if the image already looks like pixel art:
+      - few unique colours, or
+      - top-16 colours dominate the visible pixels.
+    Otherwise pick 'photo'.
+    """
+    items = unique_colors_and_counts(img_rgb, alpha)
+    total = sum(n for _c, n in items)
+    n_uniques = len(items)
+    topk = sum(n for _c, n in items[: min(16, n_uniques)])
+    share = (topk / total) if total > 0 else 1.0
+    return "pixel" if (n_uniques <= 512 or share >= 0.80) else "photo"
+
+
+# ===================== Main =====================
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(
-        description="OKLab palette mapper: closest-first, frequency conflict resolution, neighbour tone-pairing, and generic guardrails."
+    parser = argparse.ArgumentParser(
+        description="Palette remapper. Args: --mode {auto,pixel,photo}, --height N, --debug"
     )
-    p.add_argument("input", type=str, help="Input image file")
-    p.add_argument(
-        "output",
-        type=str,
-        nargs="?",
-        help="Output PNG path; default '<input_stem>_wplace.png'",
-    )
-    p.add_argument(
-        "--height", type=int, default=0, help="Downscale height; 0 keeps size"
-    )
-    p.add_argument(
+    parser.add_argument("input", help="Input image")
+    parser.add_argument("--output", "-o", help="Output path (.png forced)")
+    parser.add_argument(
         "--mode",
         choices=["auto", "pixel", "photo"],
         default="auto",
-        help="Mapping mode",
+        help="Render strategy: 'pixel' for pixel art, 'photo' for photos, 'auto' to choose.",
     )
-    p.add_argument(
-        "--auto-threshold",
+    parser.add_argument(
+        "--height",
         type=int,
-        default=4096,
-        help="Unique visible colour threshold for auto photo mode",
+        default=None,
+        help="Process height in pixels. Downscale only; never upscale. Omit to keep original.",
     )
-    args = p.parse_args()
+    parser.add_argument("--debug", action="store_true", help="Verbose debug output")
+    args = parser.parse_args()
 
-    process(args.input, args.output, args.height, args.mode, args.auto_threshold)
+    t0 = time.perf_counter()
+
+    in_path = Path(args.input)
+    out_path = (
+        Path(args.output)
+        if args.output
+        else in_path.with_name(in_path.stem + "_wplace.png")
+    )
+
+    # Load and report base size and alpha stats
+    img_rgb, alpha = load_image_rgba(in_path)
+    H0, W0, _ = img_rgb.shape
+    if args.debug:
+        a255 = int((alpha == 255).sum())
+        a0 = int((alpha == 0).sum())
+        print(f"[debug] load   {W0}x{H0}  alpha(255)={a255}  alpha(0)={a0}")
+
+    # Build palette structures
+    palette, name_of, pal_lab, pal_lch = build_palette()
+    pal_lab_mat = pal_lab.astype(np.float32)
+    pal_lch_mat = pal_lch.astype(np.float32)
+    pal_set = _palette_set(palette)
+
+    # Decide mode (auto) and resize strategy
+    mode_eff = args.mode if args.mode != "auto" else decide_auto_mode(img_rgb, alpha)
+    resample = Image.Resampling.BOX if mode_eff == "pixel" else Image.Resampling.LANCZOS
+
+    # Downscale by height only (never upscale)
+    img_rgb, alpha = resize_rgba_height(img_rgb, alpha, args.height, resample)
+    H1, W1, _ = img_rgb.shape
+    if args.debug:
+        a255 = int((alpha == 255).sum())
+        a0 = int((alpha == 0).sum())
+        print(f"[debug] size   {W1}x{H1}  alpha(255)={a255}  alpha(0)={a0}")
+        print(f"[debug] mode   {mode_eff}")
+
+    # Worker count for candidate building (pixel mode)
+    cpu = os.cpu_count() or 1
+    workers = max(1, min(32, cpu - 1))
+
+    if mode_eff == "photo":
+        # Photo pipeline
+        t_photo0 = time.perf_counter()
+        out_rgb = dither_photo(img_rgb, alpha, palette, pal_lab_mat, pal_lch_mat)
+
+        # Ensure the result is strictly in-palette (should already be, but double-lock)
+        ok0 = is_palette_only(out_rgb, alpha, pal_set)
+        if not ok0:
+            out_rgb = lock_to_palette_by_uniques(out_rgb, alpha, palette, pal_lab_mat)
+        ok1 = is_palette_only(out_rgb, alpha, pal_set)
+        if not ok1:
+            out_rgb = lock_to_palette_per_pixel(out_rgb, alpha, palette)
+        ok2 = is_palette_only(out_rgb, alpha, pal_set)
+        t_photo1 = time.perf_counter()
+
+        # Save and report
+        out_path = save_image_rgba(out_path, out_rgb, alpha)
+        if args.debug:
+            off = 0 if ok2 else count_off_palette_pixels(out_rgb, alpha, palette)
+            print(
+                f"[debug] photo  time={t_photo1 - t_photo0:.3f}s  palette_ok={ok2}  off_pixels={off}"
+            )
+        print("Mode: photo")
+        print(f"Wrote {out_path.name} | size={W1}x{H1} | palette_size={len(PALETTE)}")
+        print_color_usage(out_rgb, alpha, name_of)
+        if args.debug:
+            print(f"[debug] total  {time.perf_counter() - t0:.3f}s")
+        return
+
+    # Pixel pipeline
+    t_pix0 = time.perf_counter()
+
+    # Unique colours visible
+    sources, src_lab, src_lch = build_sources(img_rgb, alpha)
+    if len(sources) == 0:
+        out_rgb = img_rgb
+        candidates: List[List[Tuple[float, int]]] = []
+        cost_lookup: Dict[Tuple[int, int], float] = {}
+        assigned: Dict[int, int] = {}
+    else:
+        # Precompute candidate lists (possibly parallel)
+        candidates, cost_lookup = build_candidates(
+            src_lab, src_lch, pal_lab, pal_lch, sources, workers
+        )
+        # Assign each unique to a palette colour
+        assigned = assign_unique(
+            sources, candidates, cost_lookup, len(palette), src_lch, pal_lch
+        )
+
+        # Build mapping dict (source_rgb -> chosen palette rgb)
+        mapping: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
+        for i, s in enumerate(sources):
+            pal_idx = assigned.get(i, candidates[i][0][1])
+            mapping[s.rgb] = palette[pal_idx].rgb
+
+        # Apply mapping to the image
+        out_rgb = apply_mapping(img_rgb, alpha, mapping)
+
+    # Safety: lock to palette by uniques (rarely needed, fast)
+    out_rgb = lock_to_palette_by_uniques(out_rgb, alpha, palette, pal_lab_mat)
+    t_pix1 = time.perf_counter()
+
+    # Save and report
+    out_path = save_image_rgba(out_path, out_rgb, alpha)
+
+    if args.debug:
+        uniqs = unique_colors_and_counts(img_rgb, alpha)
+        top16_share = sum(n for _c, n in uniqs[: min(16, len(uniqs))]) / max(
+            1, sum(n for _c, n in uniqs)
+        )
+        print(
+            f"[debug] pixel  size_in={W0}x{H0}  size_eff={W1}x{H1}  workers={workers}  time={t_pix1 - t_pix0:.3f}s"
+        )
+        print(f"[debug] uniques_visible={len(uniqs)}  top16_share={top16_share:.3f}")
+        if len(sources) > 0:
+            print("[debug] per-unique mapping:")
+            for i, s in enumerate(sources):
+                have_row = (i < len(candidates)) and len(candidates[i]) > 0
+                pal_idx = (
+                    assigned.get(i, candidates[i][0][1])
+                    if have_row
+                    else assigned.get(i, -1)
+                )
+                if pal_idx is None or pal_idx < 0:
+                    continue
+                dE = ciede2000_pair(s.lab, pal_lab[pal_idx])
+                sL, sC, sh = s.lch.tolist()
+                tL, tC, th = pal_lch[pal_idx].tolist()
+                dh = hue_diff_deg(float(sh), float(th))
+                print(
+                    f"  src {rgb_to_hex(s.rgb):>7}  count={s.count:6d} -> {rgb_to_hex(palette[pal_idx].rgb):>7}  "
+                    f"[dE={dE:5.2f}, dL={tL - sL:+.3f}, dC={tC - sC:+.3f}, dh={dh:.1f} deg]"
+                )
+
+    print("Mode: pixel")
+    print(f"Wrote {out_path.name} | size={W1}x{H1} | palette_size={len(PALETTE)}")
+    print_color_usage(out_rgb, alpha, name_of)
+
+    if args.debug:
+        print(f"[debug] total  {time.perf_counter() - t0:.3f}s")
 
 
 if __name__ == "__main__":
