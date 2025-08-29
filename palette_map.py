@@ -43,7 +43,14 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+try:
+    from PIL import ImageCms
+except Exception:
+    ImageCms = None
+
+import io
 
 # User Palette
 
@@ -165,13 +172,13 @@ L_DARK = 45.0  # if source L is below this, do not brighten too much
 L_DARK_MAX_UP = 10.0  # how much a dark colour can brighten (absolute L)
 W_L_DARK = 0.30  # penalty for breaking the above
 W_BRIGHT_PX = 0.12  # mild preference to stay bright rather than dim
-PREF_HUE_DEG = 35.0  # "preferred" hue gate for chromatic sources
+PREF_HUE_DEG = 30.0  # "preferred" hue gate for chromatic sources
 PREF_MIN_TC_ABS = 8.0  # minimum target chroma for preferred gate
 PREF_MIN_TC_REL = 0.50  # relative to source chroma
-PREF_ENFORCE_C = 14.0  # hard-skip non-preferred if source chroma >= this
+PREF_ENFORCE_C = 16.0  # hard-skip non-preferred if source chroma >= this
 
 # Neutral rebalancing (reduces grey blending in pixel mode)
-NEUTRAL_SRC_C_MAX = 8.0  # treat source as neutral if chroma <= this
+NEUTRAL_SRC_C_MAX = 6.0  # treat source as neutral if chroma <= this
 NEUTRAL_REASSIGN_TOL = 2.5  # cost slack allowed to move to a different grey
 NEUTRAL_L_SEP = 4.0  # if neutral sources differ this much in L, avoid same grey
 
@@ -316,8 +323,27 @@ def binarise_alpha(alpha: np.ndarray, thresh: int = ALPHA_THRESH) -> np.ndarray:
 
 
 def load_image_rgba(path: Path) -> Tuple[np.ndarray, np.ndarray]:
-    """Load an image as RGBA numpy arrays (rgb uint8, alpha uint8 binarised)."""
-    im = Image.open(path).convert("RGBA")
+    """Load as RGBA with EXIF orientation and ICC→sRGB if present."""
+    with Image.open(path) as im0:
+        # Apply EXIF orientation
+        im1 = ImageOps.exif_transpose(im0)
+        # ICC → sRGB if profile exists and ImageCms is available
+        icc_bytes = im1.info.get("icc_profile")
+        if icc_bytes and ImageCms is not None:
+            try:
+                src_prof = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
+                dst_prof = ImageCms.createProfile("sRGB")
+                im = ImageCms.profileToProfile(
+                    im1,
+                    src_prof,
+                    dst_prof,
+                    renderingIntent=ImageCms.INTENT_PERCEPTUAL,
+                    outputMode="RGBA",
+                )
+            except Exception:
+                im = im1.convert("RGBA")
+        else:
+            im = im1.convert("RGBA")
     arr = np.array(im, dtype=np.uint8)
     rgb = arr[..., :3]
     alpha = binarise_alpha(arr[..., 3])
@@ -336,7 +362,7 @@ def save_image_rgba(path: Path, rgb: np.ndarray, alpha: np.ndarray) -> Path:
 
 
 def resize_rgba_height(
-    rgb: np.ndarray, alpha: np.ndarray, dst_h: int, resample: Image.Resampling
+    rgb: np.ndarray, alpha: np.ndarray, dst_h: int | None, resample: Image.Resampling
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Downscale by a requested height. Never upscale.
@@ -355,6 +381,17 @@ def resize_rgba_height(
     rgb2 = arr[..., :3]
     a2 = binarise_alpha(arr[..., 3])
     return rgb2, a2
+
+
+def is_image_file(path: Path) -> bool:
+    """True if Pillow can fully open and load the first frame."""
+    try:
+        with Image.open(path) as im:
+            im.seek(0)  # first frame for animated formats
+            im.load()  # force decode
+        return True
+    except (UnidentifiedImageError, OSError):
+        return False
 
 
 # Data Structures for Colours
@@ -488,8 +525,37 @@ def _candidate_row_for_source(
         # Base distance in Lab (perceptual-ish)
         de = ciede2000_pair(s_lab_row, pal_lab[j])
 
-        # Add a soft hue penalty so bright blues do not drift to cyan/purple
-        dh = hue_diff_deg(sh, float(pal_lch[j, 2]))
+        # Target attributes (LCH)
+        tL = float(pal_lch[j, 0])
+        tC = float(pal_lch[j, 1])
+        th = float(pal_lch[j, 2])
+
+        # Near-white, near-neutral sources should map to neutral targets
+        # (prevents very light greys drifting to light cyan/green/purple)
+        if sL >= NEAR_WHITE_L and sC <= NEAR_NEUTRAL_C and tC > NEUTRAL_C_MAX:
+            de += NEUTRAL_PENALTY
+
+        # Neutral-source guard: avoid adding chroma, with an extra block
+        # for brown/yellow band (~25..100 deg). Handles cases like
+        if sC <= NEUTRAL_SRC_C_MAX:
+            if tC > NEUTRAL_C_MAX:
+                # penalise chroma jump when the source is neutral
+                de += 0.5 * (tC - NEUTRAL_C_MAX)
+                # strong block for brown/yellow region
+                if 25.0 <= th <= 100.0:
+                    de += NEUTRAL_PENALTY
+
+        # Light grey -> brown guard (broadened L threshold a bit)
+        # If source is neutral and fairly light, prefer neutrals and
+        # penalise orange/brown picks even more.
+        if sC <= NEAR_NEUTRAL_C and sL >= 50.0:
+            if tC > NEUTRAL_C_MAX:
+                de += 0.75 * NEUTRAL_PENALTY
+            if 30.0 <= th <= 80.0 and tC >= 12.0:
+                de += NEUTRAL_PENALTY
+
+        # Soft hue penalty so bright blues do not drift to cyan/purple, etc.
+        dh = hue_diff_deg(sh, th)
         de += W_HUE_PX * hue_weight * (dh / HUE_PX_SCALE)
 
         # If the source is clearly saturated, strongly discourage big hue changes
@@ -497,7 +563,6 @@ def _candidate_row_for_source(
             de += W_HUE_RING * ((dh - H_RING) / H_RING)
 
         # Very dark source should not jump way up in lightness
-        tL = float(pal_lch[j, 0])
         if sL < L_DARK and tL > sL + L_DARK_MAX_UP:
             de += W_L_DARK * (tL - (sL + L_DARK_MAX_UP))
 
@@ -506,7 +571,6 @@ def _candidate_row_for_source(
             de += W_BRIGHT_PX * (sL - tL)
 
         # Avoid dumping saturated sources into neutral greys
-        tC = float(pal_lch[j, 1])
         if sC >= PIXEL_SAT_C and tC <= NEUTRAL_C_MAX:
             de += NEUTRAL_PENALTY
 
@@ -1463,101 +1527,160 @@ def main() -> None:
     parser.add_argument("--debug", action="store_true", help="Verbose debug printing")
     args = parser.parse_args()
 
-    t0 = time.perf_counter()
-
-    in_path = Path(args.input)
-    out_path = (
-        Path(args.output)
-        if args.output
-        else in_path.with_name(in_path.stem + "_wplace.png")
-    )
-
-    # Load input
-    img_rgb, alpha = load_image_rgba(in_path)
-    H0, W0, _ = img_rgb.shape
-    if args.debug:
-        a0_255 = int((alpha == 255).sum())
-        a0_0 = int((alpha == 0).sum())
-        print(f"[debug] load   {W0}x{H0}  alpha(255)={a0_255}  alpha(0)={a0_0}")
-
     # Build full palette once (pixel/photo use it; bw builds its own)
     palette, name_of_full, pal_lab, pal_lch = build_palette()
     pal_lab_mat = pal_lab.astype(np.float32)
     pal_lch_mat = pal_lch.astype(np.float32)
     pal_set_full = _palette_set(palette)
 
-    # Decide mode if auto
-    mode_eff = args.mode if args.mode != "auto" else decide_auto_mode(img_rgb, alpha)
+    def process_one(in_path: Path, height: int | None, allow_output_arg: bool) -> None:
 
-    # Resize policy
-    resample = (
-        Image.Resampling.BOX
-        if mode_eff in ("pixel", "bw")
-        else Image.Resampling.LANCZOS
-    )
-    img_rgb, alpha = resize_rgba_height(img_rgb, alpha, args.height, resample)
-    H1, W1, _ = img_rgb.shape
-    if args.debug:
-        a1_255 = int((alpha == 255).sum())
-        a1_0 = int((alpha == 0).sum())
-        print(f"[debug] size   {W1}x{H1}  alpha(255)={a1_255}  alpha(0)={a1_0}")
-        print(f"[debug] mode   {mode_eff}")
+        if not is_image_file(in_path):
+            print(f"[error] {in_path} is not a valid image")
+            return
 
-    # Run selected mode
-    if mode_eff == "photo":
-        t_photo0 = time.perf_counter()
-        out_rgb = dither_photo(img_rgb, alpha, palette, pal_lab_mat, pal_lch_mat)
-        # Enforce palette strictly
-        ok0 = is_palette_only(out_rgb, alpha, pal_set_full)
-        if not ok0:
-            out_rgb = lock_to_palette_by_uniques(out_rgb, alpha, palette, pal_lab_mat)
-        ok1 = is_palette_only(out_rgb, alpha, pal_set_full)
-        if not ok1:
-            out_rgb = lock_to_palette_per_pixel(out_rgb, alpha, palette)
-        ok2 = is_palette_only(out_rgb, alpha, pal_set_full)
-        t_photo1 = time.perf_counter()
+        t0 = time.perf_counter()
 
-        out_path = save_image_rgba(out_path, out_rgb, alpha)
+        out_path = (
+            Path(args.output)
+            if (allow_output_arg and args.output)
+            else in_path.with_name(in_path.stem + "_wplace.png")
+        )
+
+        in_res = in_path.resolve(strict=False)
+        out_res = out_path.resolve(strict=False)
+        if in_res == out_res:
+            out_path = in_path.with_name(in_path.stem + "_wplace.png")
+
+        # Load input
+        img_rgb, alpha = load_image_rgba(in_path)
+        H0, W0, _ = img_rgb.shape
         if args.debug:
-            off = 0 if ok2 else count_off_palette_pixels(out_rgb, alpha, palette)
+            a0_255 = int((alpha == 255).sum())
+            a0_0 = int((alpha == 0).sum())
+            print(f"[debug] load   {W0}x{H0}  alpha(255)={a0_255}  alpha(0)={a0_0}")
+
+        # Decide mode if auto
+        mode_eff = (
+            args.mode if args.mode != "auto" else decide_auto_mode(img_rgb, alpha)
+        )
+
+        # Resize policy
+        resample = (
+            Image.Resampling.BOX
+            if mode_eff in ("pixel", "bw")
+            else Image.Resampling.LANCZOS
+        )
+        img_rgb, alpha = resize_rgba_height(img_rgb, alpha, height, resample)
+        H1, W1, _ = img_rgb.shape
+        if args.debug:
+            a1_255 = int((alpha == 255).sum())
+            a1_0 = int((alpha == 0).sum())
+            print(f"[debug] size   {W1}x{H1}  alpha(255)={a1_255}  alpha(0)={a1_0}")
+            print(f"[debug] mode   {mode_eff}")
+
+        # Run selected mode
+        if mode_eff == "photo":
+            t_photo0 = time.perf_counter()
+            out_rgb = dither_photo(img_rgb, alpha, palette, pal_lab_mat, pal_lch_mat)
+            # Enforce palette strictly
+            ok0 = is_palette_only(out_rgb, alpha, pal_set_full)
+            if not ok0:
+                out_rgb = lock_to_palette_by_uniques(
+                    out_rgb, alpha, palette, pal_lab_mat
+                )
+            ok1 = is_palette_only(out_rgb, alpha, pal_set_full)
+            if not ok1:
+                out_rgb = lock_to_palette_per_pixel(out_rgb, alpha, palette)
+            ok2 = is_palette_only(out_rgb, alpha, pal_set_full)
+            t_photo1 = time.perf_counter()
+
+            out_path = save_image_rgba(out_path, out_rgb, alpha)
+            if args.debug:
+                off = 0 if ok2 else count_off_palette_pixels(out_rgb, alpha, palette)
+                print(
+                    f"[debug] photo  time={t_photo1 - t_photo0:.3f}s  palette_ok={ok2}  off_pixels={off}"
+                )
+            print("Mode: photo")
             print(
-                f"[debug] photo  time={t_photo1 - t_photo0:.3f}s  palette_ok={ok2}  off_pixels={off}"
+                f"Wrote {out_path.name} | size={W1}x{H1} | palette_size={len(PALETTE)}"
             )
-        print("Mode: photo")
+            print_color_usage(out_rgb, alpha, name_of_full)
+            if args.debug:
+                print(f"[debug] total  {time.perf_counter() - t0:.3f}s")
+            return
+
+        if mode_eff == "bw":
+            t0_bw = time.perf_counter()
+            out_rgb = dither_bw(img_rgb, alpha, palette, pal_lab_mat, pal_lch_mat)
+            out_path = save_image_rgba(out_path, out_rgb, alpha)
+            if args.debug:
+                print(
+                    f"[debug] bw     time={time.perf_counter() - t0_bw:.3f}s  greys_used={len(select_bw_indices(pal_lch_mat))}"
+                )
+            print("Mode: bw")
+            print(
+                f"Wrote {out_path.name} | size={W1}x{H1} | palette_size={len(PALETTE)}"
+            )
+            print_color_usage(out_rgb, alpha, name_of_full)
+            if args.debug:
+                print(f"[debug] total  {time.perf_counter() - t0:.3f}s")
+            return
+
+        # pixel
+        out_rgb, _name_map = run_pixel(
+            img_rgb, alpha, palette, pal_lab, pal_lch, args.debug
+        )
+        # One more pass to ensure output is strictly within the palette
+        out_rgb = lock_to_palette_by_uniques(out_rgb, alpha, palette, pal_lab_mat)
+        out_path = save_image_rgba(out_path, out_rgb, alpha)
+
+        print("Mode: pixel")
         print(f"Wrote {out_path.name} | size={W1}x{H1} | palette_size={len(PALETTE)}")
         print_color_usage(out_rgb, alpha, name_of_full)
         if args.debug:
             print(f"[debug] total  {time.perf_counter() - t0:.3f}s")
+
+    in_path = Path(args.input)
+
+    # Directory mode: process all regular files in the folder, ignore --height
+    if in_path.is_dir():
+        ALLOWED_EXT = {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".bmp",
+            ".tif",
+            ".tiff",
+            ".gif",
+        }
+        for f in sorted(in_path.iterdir()):
+            if not f.is_file():
+                continue
+            name_l = f.name.lower()
+            if name_l.endswith("_wplace.png"):
+                if args.debug:
+                    print(f"[debug] skip already-processed: {f.name}")
+                continue
+            if f.suffix.lower() not in ALLOWED_EXT:
+                if args.debug:
+                    print(f"[debug] skip by ext: {f.name}")
+                continue
+            if not is_image_file(f):
+                if args.debug:
+                    print(f"[debug] skip non-image: {f.name}")
+                continue
+            try:
+                process_one(
+                    f, None, allow_output_arg=False
+                )  # height ignored in folder mode
+            except Exception as e:
+                print(f"[error] {f.name}: {e}")
         return
 
-    if mode_eff == "bw":
-        t0_bw = time.perf_counter()
-        out_rgb = dither_bw(img_rgb, alpha, palette, pal_lab_mat, pal_lch_mat)
-        out_path = save_image_rgba(out_path, out_rgb, alpha)
-        if args.debug:
-            print(
-                f"[debug] bw     time={time.perf_counter() - t0_bw:.3f}s  greys_used={len(select_bw_indices(pal_lch_mat))}"
-            )
-        print("Mode: bw")
-        print(f"Wrote {out_path.name} | size={W1}x{H1} | palette_size={len(PALETTE)}")
-        print_color_usage(out_rgb, alpha, name_of_full)
-        if args.debug:
-            print(f"[debug] total  {time.perf_counter() - t0:.3f}s")
-        return
-
-    # pixel
-    out_rgb, _name_map = run_pixel(
-        img_rgb, alpha, palette, pal_lab, pal_lch, args.debug
-    )
-    # One more pass to ensure output is strictly within the palette
-    out_rgb = lock_to_palette_by_uniques(out_rgb, alpha, palette, pal_lab_mat)
-    out_path = save_image_rgba(out_path, out_rgb, alpha)
-
-    print("Mode: pixel")
-    print(f"Wrote {out_path.name} | size={W1}x{H1} | palette_size={len(PALETTE)}")
-    print_color_usage(out_rgb, alpha, name_of_full)
-    if args.debug:
-        print(f"[debug] total  {time.perf_counter() - t0:.3f}s")
+    # Single file mode (original behavior)
+    process_one(in_path, args.height, allow_output_arg=True)
 
 
 if __name__ == "__main__":
