@@ -1,69 +1,40 @@
 # palette_map/__init__.py
-from __future__ import annotations
+"""
+palette_map package.
 
-__version__ = "0.1.0"
+Exports:
+- run_pixel: refined pixel-mode mapper
+- analysis, color_convert, core_types, enforce, palette_data modules
+- PALETTE (if defined in palette_data)
 
-# Core data & builders
-from .palette_data import PALETTE, GREY_HEXES, build_palette
+Usage:
+    from palette_map import run_pixel
+    from palette_map.color_convert import lab_to_lch, rgb_to_lab
+"""
 
-# Types
-from .core_types import PaletteItem, SourceItem
+__version__ = "0.1.1"
 
-# Colour conversion utilities
-from .color_convert import srgb_to_lab_batch, lab_to_lch_batch
-from .analysis import ciede2000_pair
+# Core namespaces
+from . import color_convert as color_convert
+from . import core_types as core_types
+from . import palette_lock as palette_lock
+from . import palette_data as palette_data
 
-# Image I/O
-from .image_io import (
-    load_image_rgba,
-    save_image_rgba,
-    resize_rgba_height,
-    binarise_alpha,
-    is_image_file,
-)
+# Data
+try:
+    from .palette_data import PALETTE as PALETTE  # type: ignore
+except Exception:
+    PALETTE = None  # type: ignore[assignment]
 
-# Mode helpers
-from .mode import decide_auto_mode
-
-# Enforcers (palette locking)
-from .enforce import (
-    lock_to_palette_by_uniques,
-    lock_to_palette_per_pixel,
-    is_palette_only,
-)
-
-# BW / Photo / Pixel entry points
-from .bw import dither_bw
-from .photo import dither_photo
-from .pixel import run_pixel
+# Pixel mode entry (no stub; fail fast if missing)
+from .pixel.run import run_pixel  # type: ignore
 
 __all__ = [
     "__version__",
-    # data
+    "color_convert",
+    "core_types",
+    "palette_lock",
+    "palette_data",
     "PALETTE",
-    "GREY_HEXES",
-    "build_palette",
-    # types
-    "PaletteItem",
-    "SourceItem",
-    # color utils
-    "srgb_to_lab_batch",
-    "lab_to_lch_batch",
-    "ciede2000_pair",
-    # io
-    "load_image_rgba",
-    "save_image_rgba",
-    "resize_rgba_height",
-    "binarise_alpha",
-    "is_image_file",
-    # mode
-    "decide_auto_mode",
-    # enforce
-    "lock_to_palette_by_uniques",
-    "lock_to_palette_per_pixel",
-    "is_palette_only",
-    # algorithms
-    "dither_bw",
-    "dither_photo",
     "run_pixel",
 ]

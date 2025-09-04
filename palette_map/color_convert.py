@@ -2,92 +2,90 @@
 from __future__ import annotations
 
 import numpy as np
-
 from .core_types import Lab, Lch
 
 """
-sRGB ↔ Lab/LCh conversions (D65) with vectorized NumPy implementations.
+sRGB ↔ Lab/LCh (D65). Vectorized NumPy implementations.
 
 Exports:
-- _srgb_to_linear(u)
-- srgb_to_lab_batch(rgb_u8)
+- rgb_to_linear(u)
+- rgb_to_lab(rgb)
 - lab_to_lch_batch(lab)
-- srgb_to_lab(rgb_u8)
 - lab_to_lch(lab)
+- srgb_to_lab(rgb)            # legacy shim → rgb_to_lab
+- srgb_to_lab_batch(rgb)      # legacy shim → rgb_to_lab
 """
 
 
-def _srgb_to_linear(u: np.ndarray) -> np.ndarray:
+def rgb_to_linear(u: np.ndarray) -> np.ndarray:
     """
-    sRGB (nonlinear 0..1) → linear RGB (0..1), vectorized.
-    Accepts float array in [0,1]; returns float32.
+    sRGB (nonlinear 0..1) → linear RGB (0..1). Vectorized. Returns float32.
+    Accepts any shape (..., 3).
     """
-    u = u.astype(np.float32)
+    u = u.astype(np.float32, copy=False)
     return np.where(u <= 0.04045, u / 12.92, ((u + 0.055) / 1.055) ** 2.4).astype(
-        np.float32
+        np.float32, copy=False
     )
 
 
-def srgb_to_lab_batch(rgb_u8: np.ndarray) -> Lab:
+def rgb_to_lab(rgb: np.ndarray) -> Lab:
     """
-    Vectorized sRGB(uint8)[...,3] → Lab(float32)[...,3] under D65.
-    Works for (H,W,3) or (N,3).
+    sRGB → CIE Lab (D65). Accepts uint8 [0..255] or float32/float64 [0..1].
+    Preserves input shape (..., 3). Returns float32.
     """
-    orig_shape = rgb_u8.shape
-    flat = rgb_u8.reshape(-1, 3).astype(np.float32) / 255.0
+    arr = rgb.astype(np.float32, copy=False)
+    if arr.max() > 1.0:
+        arr = arr / 255.0
 
-    rl = _srgb_to_linear(flat[:, 0])
-    gl = _srgb_to_linear(flat[:, 1])
-    bl = _srgb_to_linear(flat[:, 2])
+    # sRGB → linear
+    rl, gl, bl = (
+        rgb_to_linear(arr[..., 0]),
+        rgb_to_linear(arr[..., 1]),
+        rgb_to_linear(arr[..., 2]),
+    )
 
-    # sRGB to XYZ (D65)
-    X = rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375
-    Y = rl * 0.2126729 + gl * 0.7151522 + bl * 0.0721750
-    Z = rl * 0.0193339 + gl * 0.1191920 + bl * 0.9503041
+    # linear RGB → XYZ (D65)
+    X = 0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl
+    Y = 0.2126729 * rl + 0.7151522 * gl + 0.0721750 * bl
+    Z = 0.0193339 * rl + 0.1191920 * gl + 0.9503041 * bl
 
-    # Reference white (D65)
-    Xn, Yn, Zn = 0.95047, 1.0, 1.08883
-    x = X / Xn
-    y = Y / Yn
-    z = Z / Zn
+    # XYZ → Lab (D65 white)
+    Xn, Yn, Zn = 0.95047, 1.00000, 1.08883
+    x, y, z = X / Xn, Y / Yn, Z / Zn
+    e, k = 216.0 / 24389.0, 24389.0 / 27.0
 
     def f(t: np.ndarray) -> np.ndarray:
-        return np.where(t > 0.008856, np.cbrt(t), 7.787 * t + 16.0 / 116.0).astype(
-            np.float32
+        return np.where(t > e, np.cbrt(t), (k * t + 16.0) / 116.0).astype(
+            np.float32, copy=False
         )
 
-    fx = f(x)
-    fy = f(y)
-    fz = f(z)
-
+    fx, fy, fz = f(x), f(y), f(z)
     L = 116.0 * fy - 16.0
     a = 500.0 * (fx - fy)
     b = 200.0 * (fy - fz)
 
-    lab = np.stack([L, a, b], axis=1).astype(np.float32)
-    return lab.reshape(orig_shape)
+    out = np.empty(arr.shape, dtype=np.float32)
+    out[..., 0] = L
+    out[..., 1] = a
+    out[..., 2] = b
+    return out  # type: ignore[return-value]
 
 
 def lab_to_lch_batch(lab: Lab) -> Lch:
     """
-    Vectorized Lab(float32)[...,3] → LCh(float32)[...,3].
+    Lab(float32)[...,3] → LCh(float32)[...,3].
     L*=L, C*=sqrt(a^2+b^2), h°=atan2(b,a) in degrees [0,360).
+    Shape is preserved.
     """
-    orig_shape = lab.shape
-    flat = lab.reshape(-1, 3).astype(np.float32)
+    orig = lab.shape
+    flat = lab.reshape(-1, 3).astype(np.float32, copy=False)
     L = flat[:, 0]
     a = flat[:, 1]
     b = flat[:, 2]
     C = np.hypot(a, b)
-    h = np.degrees(np.arctan2(b, a))
-    h = (h + 360.0) % 360.0
-    lch = np.stack([L, C, h], axis=1).astype(np.float32)
-    return lch.reshape(orig_shape)
-
-
-def srgb_to_lab(rgb_u8: np.ndarray) -> Lab:
-    """Convenience wrapper; identical to srgb_to_lab_batch for any shape."""
-    return srgb_to_lab_batch(rgb_u8)
+    h = (np.degrees(np.arctan2(b, a)) + 360.0) % 360.0
+    lch = np.stack([L, C, h], axis=1).astype(np.float32, copy=False)
+    return lch.reshape(orig)  # type: ignore[return-value]
 
 
 def lab_to_lch(lab: Lab) -> Lch:
@@ -96,9 +94,8 @@ def lab_to_lch(lab: Lab) -> Lch:
 
 
 __all__ = [
-    "_srgb_to_linear",
-    "srgb_to_lab_batch",
+    "rgb_to_linear",
+    "rgb_to_lab",
     "lab_to_lch_batch",
-    "srgb_to_lab",
     "lab_to_lch",
 ]
