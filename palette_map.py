@@ -336,7 +336,6 @@ def _print_per_unique(
     pal_rgb: U8Image,
     pal_lab: Lab,
     pal_lch: Lch,
-    name_of: NameOf,
 ) -> None:
     if uniq_rgb.shape[0] == 0:
         print("[debug] per-unique mapping: (no visible pixels)", flush=True)
@@ -410,7 +409,6 @@ def _print_debug_photo(
 def _colour_usage_report(
     mapped_rgb: U8Image,
     alpha: U8Mask,
-    pal_hex: List[str],
     name_of: NameOf,
 ) -> List[Tuple[str, str, int]]:
     vis = alpha > 0
@@ -479,11 +477,11 @@ def _process_one(
         new_w = int(round(w0 * (new_h / h0)))
         res = _pil_resample(resample_eff)
         rgb_in = np.array(
-            Image.fromarray(rgb_in, mode="RGB").resize((new_w, new_h), res),
+            Image.fromarray(rgb_in).resize((new_w, new_h), res),
             dtype=np.uint8,
         )
         alpha = np.array(
-            Image.fromarray(alpha, mode="L").resize((new_w, new_h), res), dtype=np.uint8
+            Image.fromarray(alpha).resize((new_w, new_h), res), dtype=np.uint8
         )
     t_r1 = time.perf_counter()
 
@@ -513,7 +511,7 @@ def _process_one(
                 f"[debug] uniques_visible={uniq_rgb.shape[0]}  top16_share={share:.3f}",
                 flush=True,
             )
-
+            
         else:
             _print_debug_photo(uniq_rgb, counts, pal_rgb, pal_lab, name_of, top_k=20)
 
@@ -560,7 +558,7 @@ def _process_one(
         flush=True,
     )
     print("Colours used:", flush=True)
-    for hhex, nm, cnt in _colour_usage_report(mapped, alpha, pal_hex, name_of):
+    for hhex, nm, cnt in _colour_usage_report(mapped, alpha, name_of):
         print(f"  {hhex}  {nm}: {cnt}", flush=True)
     print(
         f"[debug] total  {_fmt_secs(t3 - t0)}  "

@@ -62,7 +62,6 @@ def dither_bw(
     img_rgb: U8Image,
     alpha: U8Mask,
     palette: List[PaletteItem],
-    pal_lab_mat: Lab,
     pal_lch_mat: Lch,
     *,
     workers: int = 1,

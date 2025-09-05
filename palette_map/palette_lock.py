@@ -34,23 +34,6 @@ def is_palette_only(img_rgb: U8Image, alpha: U8Mask, pal_set: Set[RGBTuple]) -> 
     return True
 
 
-def count_off_palette_pixels(
-    img_rgb: U8Image, alpha: U8Mask, palette: List[PaletteItem]
-) -> int:
-    """Count visible pixels whose RGB is not present in the palette."""
-    pal = palette_set(palette)
-    c = 0
-    for y, x in _iter_visible_coords(alpha):
-        t: RGBTuple = (
-            int(img_rgb[y, x, 0]),
-            int(img_rgb[y, x, 1]),
-            int(img_rgb[y, x, 2]),
-        )
-        if t not in pal:
-            c += 1
-    return c
-
-
 def lock_to_palette_by_uniques(
     out_rgb: U8Image,
     alpha: U8Mask,
@@ -148,5 +131,4 @@ __all__ = [
     "is_palette_only",
     "lock_to_palette_by_uniques",
     "lock_to_palette_per_pixel",
-    "count_off_palette_pixels",
 ]
