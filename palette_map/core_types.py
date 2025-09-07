@@ -104,6 +104,20 @@ def hex_to_rgb(s: str) -> RGBTuple:
     return (int(s[1:3], 16), int(s[3:5], 16), int(s[5:7], 16))
 
 
+def hex_list_to_u8_rgb(hex_list: Sequence[str]) -> U8Image:
+    """
+    Convert a sequence of hex strings ('#rrggbb' or 'rrggbb') to a (N,3) uint8 array.
+    Uses hex_to_rgb to keep one source of truth.
+    """
+    arr = np.empty((len(hex_list), 3), dtype=np.uint8)
+    for i, hx in enumerate(hex_list):
+        r, g, b = hex_to_rgb(hx if hx.startswith("#") else f"#{hx}")
+        arr[i, 0] = r
+        arr[i, 1] = g
+        arr[i, 2] = b
+    return arr
+
+
 def ensure_rgb_tuple(x: Union[Sequence[int], NDArray[np.generic]]) -> RGBTuple:
     """
     Coerce a 3-length sequence/array to (int,int,int).
@@ -122,13 +136,13 @@ def ensure_rgb_tuple(x: Union[Sequence[int], NDArray[np.generic]]) -> RGBTuple:
 def assert_u8_image(img: np.ndarray) -> U8Image:
     if img.dtype != np.uint8 or img.ndim != 3 or img.shape[-1] < 3:
         raise TypeError("expected uint8 (H,W,3/4) image")
-    return img  # type: ignore[return-value]
+    return img  
 
 
 def assert_u8_mask(mask: np.ndarray) -> U8Mask:
     if mask.dtype != np.uint8 or mask.ndim != 2:
         raise TypeError("expected uint8 (H,W) mask")
-    return mask  # type: ignore[return-value]
+    return mask 
 
 
 # ---- lightweight function type aliases (for clarity, optional to use)
@@ -173,6 +187,7 @@ __all__ = [
     "hue_in",
     "rgb_to_hex",
     "hex_to_rgb",
+    "hex_list_to_u8_rgb",
     "ensure_rgb_tuple",
     "assert_u8_image",
     "assert_u8_mask",

@@ -1,153 +1,57 @@
 #!/usr/bin/env python3
-# palette_map.py — ordered debug blocks; skip *_wplace; mode=auto|pixel|photo|bw
+# palette_map.py — recolour images to project palette
 from __future__ import annotations
 
 import argparse
-import inspect
 import io
 import os
 import sys
 import time
+import inspect
 from contextlib import redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
-from types import SimpleNamespace
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
-from palette_map import run_pixel
-from palette_map.core_types import (
-    U8Image,
-    U8Mask,
-    Lab,
-    Lch,
-    NameOf,
-)
-from palette_map.color_convert import lab_to_lch, rgb_to_lab
+# mappers
+from palette_map.pixel.run import (
+    run_pixel,
+)  # (rgb, a, pal_rgb, pal_lab, pal_lch, debug)->rgb
+from palette_map.photo.dither import (
+    dither_photo,
+)  # (rgb, a, items, pal_lab, pal_lch, workers, ...)->rgb
+
+# (rgb, a, pal_rgb, pal_lab, pal_lch, workers, ...)->rgb
+
+# palette + helpers
+from palette_map.palette_data import build_palette
+from palette_map.core_types import PaletteItem, U8Image, U8Mask, Lab, Lch, NameOf
+from palette_map.colour_convert import rgb_to_lab, lab_to_lch
+from palette_map.colour_select import restrict_palette  # colours="full"|"limited"|"bw"
 
 
-# ---------------- I/O + buffering helpers ----------------
+# ---------------- small utils ----------------
+def _fmt_secs(s: float) -> str:
+    if s < 60:
+        return f"{s*1000:.1f}ms" if s < 1 else f"{s:.3f}s"
+    m = int(s // 60)
+    return f"{m}m {s - 60*m:.1f}s"
 
 
 def _enable_line_buffered_stdout() -> None:
-    """Try to make stdout line-buffered so progress prints appear continuously."""
-    try:
-        sys.stdout.reconfigure(line_buffering=True, write_through=True)  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-
-# ---------------- Palette helpers ----------------
-
-
-def _get_palette_items_from_pkg():
-    try:
-        from palette_map.palette_data import build_palette  # type: ignore
-
-        res = build_palette()
-        if isinstance(res, tuple):
-            for el in res:
-                if isinstance(el, list):
-                    return el
-            return res[0]
-        return res
-    except Exception:
-        return None
-
-
-def _call_dither_dynamic(
-    fn: Any,
-    rgb_in: U8Image,
-    alpha: U8Mask,
-    pal_rgb: U8Image,
-    pal_lab: Lab,
-    pal_lch: Lch,
-    workers: int,
-    debug: bool,
-) -> U8Image:
-    try:
-        sig = inspect.signature(fn)
-    except Exception:
-        return fn(rgb_in, alpha, pal_rgb, pal_lab, pal_lch)
-
-    args = [rgb_in, alpha]
-    kwargs = {}
-
-    items = _get_palette_items_from_pkg()
-    if items is None or (
-        hasattr(pal_lab, "shape") and len(items) != int(pal_lab.shape[0])
-    ):
-        items = [
-            SimpleNamespace(rgb=(int(r), int(g), int(b)))
-            for r, g, b in pal_rgb.tolist()
-        ]
-
-    if "palette" in sig.parameters:
-        kwargs["palette"] = items
-    elif "palette_items" in sig.parameters:
-        kwargs["palette_items"] = items
-
-    if "pal_lab_mat" in sig.parameters:
-        kwargs["pal_lab_mat"] = pal_lab
-    elif "pal_lab" in sig.parameters:
-        kwargs["pal_lab"] = pal_lab
-
-    if "pal_lch_mat" in sig.parameters:
-        kwargs["pal_lch_mat"] = pal_lch
-    elif "pal_lch" in sig.parameters:
-        kwargs["pal_lch"] = pal_lch
-
-    if "workers" in sig.parameters:
-        kwargs["workers"] = workers
-    if "debug" in sig.parameters:
-        kwargs["debug"] = debug
-
-    return fn(*args, **kwargs)
-
-
-def _call_photo_dither(
-    rgb_in: U8Image,
-    alpha: U8Mask,
-    pal_rgb: U8Image,
-    pal_lab: Lab,
-    pal_lch: Lch,
-    workers: int,
-    debug: bool,
-) -> U8Image:
-    try:
-        from palette_map.photo.dither import dither_photo  # type: ignore
-    except Exception:
-        return _map_nearest(rgb_in, alpha, pal_rgb, pal_lab)
-    return _call_dither_dynamic(
-        dither_photo, rgb_in, alpha, pal_rgb, pal_lab, pal_lch, workers, debug
-    )
-
-
-def _call_bw_dither(
-    rgb_in: U8Image,
-    alpha: U8Mask,
-    pal_rgb: U8Image,
-    pal_lab: Lab,
-    pal_lch: Lch,
-    workers: int,
-    debug: bool,
-) -> U8Image:
-    try:
-        from palette_map.bw.dither import dither_bw  # type: ignore
-    except Exception:
-        gray = np.dot(rgb_in.astype(np.float32), [0.2126, 0.7152, 0.0722])
-        rgb_mono = np.repeat(gray[..., None], 3, axis=-1).astype(np.uint8)
-        return _map_nearest(rgb_mono, alpha, pal_rgb, pal_lab)
-    return _call_dither_dynamic(
-        dither_bw, rgb_in, alpha, pal_rgb, pal_lab, pal_lch, workers, debug
-    )
+    # Avoid type-checker warning: gate call via getattr
+    f = getattr(sys.stdout, "reconfigure", None)
+    if callable(f):
+        try:
+            f(line_buffering=True, write_through=True)
+        except Exception:
+            pass
 
 
 # ---------------- CLI ----------------
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="palette_map",
@@ -159,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--mode",
-        choices=["auto", "pixel", "photo", "bw"],
+        choices=["auto", "pixel", "photo"],
         default="auto",
         help="Mapping mode.",
     )
@@ -173,7 +77,15 @@ def parse_args() -> argparse.Namespace:
         "--resample",
         choices=["auto", "nearest", "bilinear", "bicubic", "lanczos"],
         default="auto",
-        help='Scaling filter. "auto" => nearest for pixel, lanczos for photo/bw.',
+        help='Scaling filter. "auto" => nearest for pixel, lanczos for photo.',
+    )
+    # --limit without a number => auto-limited; with N => cap at N; omitted => full palette
+    p.add_argument(
+        "--limit",
+        nargs="?",
+        const=-1,
+        type=int,
+        help="Restrict to top-K palette colours. Omit value for auto K; omit flag for full palette.",
     )
     p.add_argument("--jobs", type=int, default=1, help="Files processed in parallel")
     p.add_argument(
@@ -183,27 +95,27 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# ---------------- Palette ----------------
+# ---------------- palette build ----------------
+def _build_palette_views() -> Tuple[U8Image, Lab, Lch, List[PaletteItem], NameOf]:
+    # items (PaletteItem list), name_of_rgb (RGBTuple->str), pal_lab, pal_lch
+    items, name_of, pal_lab, pal_lch = build_palette()
+    # ndarray (P,3) for mappers needing arrays
+    pal_rgb: U8Image = np.array([pi.rgb for pi in items], dtype=np.uint8)
+    # NameOf requires "#rrggbb" keys
+    name_of_hex: NameOf = {
+        f"#{r:02x}{g:02x}{b:02x}": items[i].name
+        for i, (r, g, b) in enumerate(pal_rgb.tolist())
+    }
+    return (
+        pal_rgb,
+        pal_lab.astype(np.float32),
+        pal_lch.astype(np.float32),
+        items,
+        name_of_hex,
+    )
 
 
-def _hex_to_rgb_array(hex_list: List[str]) -> U8Image:
-    arr = np.zeros((len(hex_list), 3), dtype=np.uint8)
-    for i, hx in enumerate(hex_list):
-        s = hx[1:] if hx.startswith("#") else hx
-        arr[i] = [int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)]
-    return arr
-
-
-def load_palette() -> Tuple[U8Image, List[str], NameOf]:
-    from palette_map import PALETTE
-
-    pal_hex: List[str] = [h for h, _ in PALETTE]
-    pal_rgb: U8Image = _hex_to_rgb_array(pal_hex)
-    name_of: NameOf = {h: n for h, n in PALETTE}
-    return pal_rgb, pal_hex, name_of
-
-
-# ---------------- Mapping ----------------
+# ---------------- basic colour ops ----------------
 
 
 def nearest_palette_indices(src_lab: Lab, pal_lab: Lab) -> np.ndarray:
@@ -225,9 +137,7 @@ def _map_nearest(
     return pal_rgb[idx].reshape(rgb_in.shape).astype(np.uint8)
 
 
-# ---------------- I/O ----------------
-
-
+# ---------------- IO ----------------
 def _pil_resample(name: str) -> int:
     if name == "nearest":
         return Image.Resampling.NEAREST
@@ -255,14 +165,20 @@ def _save_png_rgb_a(path: Path, rgb: U8Image, alpha: U8Mask) -> None:
     Image.fromarray(out).save(path)
 
 
-# ---------------- Utils ----------------
-
-
-def _fmt_secs(s: float) -> str:
-    if s < 60:
-        return f"{s:.3f}s"
-    m = int(s // 60)
-    return f"{m}m {s - 60*m:.1f}s"
+# ---------------- stats & debug prints ----------------
+def _fmt_eta(seconds: float | None) -> str:
+    if seconds is None or not np.isfinite(seconds) or seconds < 0:
+        return "--:--"
+    s = int(round(seconds))
+    if s >= 3600:
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h}h {m}m"
+    if s >= 60:
+        m = s // 60
+        r = s % 60
+        return f"{m}m {r}s"
+    return f"{s}s"
 
 
 def _unique_visible(rgb: U8Image, alpha: U8Mask) -> Tuple[U8Image, np.ndarray]:
@@ -286,87 +202,6 @@ def _weighted_percentile(values: np.ndarray, weights: np.ndarray, q: float) -> f
     return float(v[min(idx, len(v) - 1)])
 
 
-def _is_grayscaleish(
-    rgb: U8Image, alpha: U8Mask, tol: int = 3, frac: float = 0.95
-) -> bool:
-    vis = alpha > 0
-    if not np.any(vis):
-        return False
-    r, g, b = [rgb[..., i].astype(np.int16) for i in (0, 1, 2)]
-    d1 = np.abs(r - g)[vis]
-    d2 = np.abs(g - b)[vis]
-    ok = np.logical_and(d1 <= tol, d2 <= tol)
-    return (np.count_nonzero(ok) / ok.size) >= frac
-
-
-def decide_auto_mode(img_rgb: U8Image, alpha: U8Mask) -> str:
-    """
-    Pixel vs Photo heuristic (old behavior):
-      - If unique colours <= 512 OR the top-16 colours cover >= 80% of visible
-        pixels, choose 'pixel'.
-      - Otherwise choose 'photo'.
-    """
-    uniq, counts = _unique_visible(img_rgb, alpha)
-    n_uniques = int(uniq.shape[0])
-    if n_uniques == 0:
-        return "pixel"
-
-    total = int(counts.sum())
-    if total == 0:
-        return "pixel"
-
-    k = min(16, n_uniques)
-    # sum of largest-k counts
-    topk = int(np.sort(counts)[-k:].sum()) if k > 0 else 0
-    share = (topk / total) if total > 0 else 1.0
-
-    return "pixel" if (n_uniques <= 512 or share >= 0.80) else "photo"
-
-
-def _auto_pick_mode(rgb: U8Image, alpha: U8Mask) -> str:
-    # keep BW detection first
-    if _is_grayscaleish(rgb, alpha, tol=3, frac=0.95):
-        return "bw"
-    return decide_auto_mode(rgb, alpha)
-
-
-def _print_per_unique(
-    uniq_rgb: U8Image,
-    counts: np.ndarray,
-    pal_rgb: U8Image,
-    pal_lab: Lab,
-    pal_lch: Lch,
-) -> None:
-    if uniq_rgb.shape[0] == 0:
-        print("[debug] per-unique mapping: (no visible pixels)", flush=True)
-        return
-    src_lab: Lab = rgb_to_lab(uniq_rgb.astype(np.float32))
-    src_lch: Lch = lab_to_lch(src_lab)
-    idx = nearest_palette_indices(src_lab, pal_lab)
-    order = np.argsort(-counts)
-    print("[debug] per-unique mapping:", flush=True)
-    for i in order:
-        s_hex = f"#{uniq_rgb[i,0]:02x}{uniq_rgb[i,1]:02x}{uniq_rgb[i,2]:02x}"
-        j = int(idx[i])
-        t_rgb = pal_rgb[j]
-        t_lab = pal_lab[j]
-        t_lch = pal_lch[j]
-        dE = float(np.linalg.norm(t_lab - src_lab[i]))
-        dL = float(t_lch[0] - src_lch[i, 0])
-        dC = float(t_lch[1] - src_lch[i, 1])
-        dh = float(t_lch[2] - src_lch[i, 2])
-        while dh > 180.0:
-            dh -= 360.0
-        while dh < -180.0:
-            dh += 360.0
-        t_hex = f"#{t_rgb[0]:02x}{t_rgb[1]:02x}{t_rgb[2]:02x}"
-        print(
-            f"  src {s_hex}  count={counts[i]:5d} -> {t_hex}  "
-            f"[dE={dE:5.2f}, dL={dL:+6.3f}, dC={dC:+6.3f}, dh={dh:4.1f} deg]",
-            flush=True,
-        )
-
-
 def _print_debug_photo(
     uniq_rgb: U8Image,
     counts: np.ndarray,
@@ -386,18 +221,18 @@ def _print_debug_photo(
     de_p50 = _weighted_percentile(de, counts, 0.50)
     de_p90 = _weighted_percentile(de, counts, 0.90)
     de_p99 = _weighted_percentile(de, counts, 0.99)
-    agg_counts: Dict[int, int] = {}
+    agg: Dict[int, int] = {}
     for j, c in zip(idx.tolist(), counts.tolist()):
-        agg_counts[j] = agg_counts.get(j, 0) + c
+        agg[j] = agg.get(j, 0) + c
     total = int(counts.sum())
-    mapped_colours = len(agg_counts)
+    mapped_colours = len(agg)
     print(
         f"[debug] uniques_visible={uniq_rgb.shape[0]}  mapped_colours={mapped_colours}  "
         f"dE_mean={de_mean:.2f}  dE_p50={de_p50:.2f}  dE_p90={de_p90:.2f}  dE_p99={de_p99:.2f}",
         flush=True,
     )
     print(f"[debug] per-mapped palette (top {top_k}):", flush=True)
-    top = sorted(agg_counts.items(), key=lambda kv: -kv[1])[:top_k]
+    top = sorted(agg.items(), key=lambda kv: -kv[1])[:top_k]
     for j, c in top:
         rgb = pal_rgb[j]
         hhex = f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
@@ -407,9 +242,7 @@ def _print_debug_photo(
 
 
 def _colour_usage_report(
-    mapped_rgb: U8Image,
-    alpha: U8Mask,
-    name_of: NameOf,
+    mapped_rgb: U8Image, alpha: U8Mask, name_of: NameOf
 ) -> List[Tuple[str, str, int]]:
     vis = alpha > 0
     if not np.any(vis):
@@ -423,84 +256,128 @@ def _colour_usage_report(
     return out
 
 
-# ---------------- One file ----------------
+# ---------------- mode pick ----------------
+def decide_auto_mode(img_rgb: U8Image, alpha: U8Mask, pal_lab: Lab) -> str:
+    """
+    pixel  — few uniques or very concentrated raw colours
+    photo  — otherwise
+    """
+    uniq, counts = _unique_visible(img_rgb, alpha)
+    n_uniques = int(uniq.shape[0])
+    if n_uniques == 0:
+        return "pixel"
+
+    total = int(counts.sum()) or 1
+    # raw-unique concentration check (legacy pixel/photo split)
+    k_raw = min(16, n_uniques)
+    topk_raw_share = (np.sort(counts)[-k_raw:].sum() / total) if k_raw > 0 else 1.0
+
+    # quick coarse map of uniques -> palette bins
+    src_lab = rgb_to_lab(uniq.astype(np.float32))
+    idx = nearest_palette_indices(src_lab, pal_lab.astype(np.float32))
+    bin_counts = np.bincount(
+        idx, weights=counts.astype(np.float64), minlength=pal_lab.shape[0]
+    )
+    # Classic pixel vs photo
+    if (n_uniques <= 512) or (topk_raw_share >= 0.80):
+        return "pixel"
+    return "photo"
 
 
+# ---------------- one-file pipeline ----------------
 def _process_one(
     src_path: Path,
-    out_path: Path | None,
+    out_path: Optional[Path],
     mode: str,
-    height: int | None,
+    height: Optional[int],
     resample_sel: str,
     debug: bool,
     workers: int,
     pal_rgb: U8Image,
-    pal_hex: List[str],
-    name_of: NameOf,
     pal_lab: Lab,
     pal_lch: Lch,
+    items: List[PaletteItem],  # for photo
+    name_of_hex: NameOf,
+    limit_arg: Optional[int],
 ) -> None:
     t0 = time.perf_counter()
     if out_path is None:
         out_path = src_path.with_name(f"{src_path.stem}_wplace.png")
 
-    rgb_in, alpha = _load_rgba(src_path)
+    print(f"\n=== {src_path.name} ===", flush=True)
 
+    rgb_in, alpha = _load_rgba(src_path)
+    h0, w0 = rgb_in.shape[0], rgb_in.shape[1]
+
+    # choose mode
     eff_mode = mode
     if mode == "auto":
-        eff_mode = _auto_pick_mode(rgb_in, alpha)
+        eff_mode = decide_auto_mode(rgb_in, alpha, pal_lab)
         if debug:
             print(f"[debug] auto picked mode = {eff_mode}", flush=True)
 
-    resample_eff = (
-        resample_sel
-        if resample_sel != "auto"
-        else ("nearest" if eff_mode == "pixel" else "lanczos")
-    )
-
-    if eff_mode == "bw":
-        gray = np.dot(rgb_in.astype(np.float32), [0.2126, 0.7152, 0.0722])
-        rgb_in = np.repeat(gray[..., None], 3, axis=-1).astype(np.uint8)
-
-    h0, w0 = rgb_in.shape[0], rgb_in.shape[1]
-    if debug:
-        a_full = int(np.count_nonzero(alpha == 255))
-        a_zero = int(np.count_nonzero(alpha == 0))
-        print(
-            f"[debug] load   {w0}x{h0}  alpha(255)={a_full}  alpha(0)={a_zero}",
-            flush=True,
-        )
-
+    # resize if needed
     t_r0 = time.perf_counter()
     if height is not None and h0 > height:
         new_h = height
         new_w = int(round(w0 * (new_h / h0)))
-        res = _pil_resample(resample_eff)
+        res_name = (
+            resample_sel
+            if resample_sel != "auto"
+            else ("nearest" if eff_mode in ("pixel") else "lanczos")
+        )
+        res = _pil_resample(res_name)
         rgb_in = np.array(
-            Image.fromarray(rgb_in).resize((new_w, new_h), res),
-            dtype=np.uint8,
+            Image.fromarray(rgb_in).resize((new_w, new_h), res), dtype=np.uint8
         )
         alpha = np.array(
             Image.fromarray(alpha).resize((new_w, new_h), res), dtype=np.uint8
         )
-    t_r1 = time.perf_counter()
 
+    t_r1 = time.perf_counter()
     h, w = rgb_in.shape[0], rgb_in.shape[1]
+
     if debug:
-        a_full = int(np.count_nonzero(alpha == 255))
-        a_zero = int(np.count_nonzero(alpha == 0))
+        a_full0 = int(np.count_nonzero(alpha == 255))
+        a_zero0 = int(np.count_nonzero(alpha == 0))
         print(
-            f"[debug] size   {w}x{h}  alpha(255)={a_full}  alpha(0)={a_zero}",
+            f"[debug] load   {w0}x{h0}  alpha(255)={a_full0}  alpha(0)={a_zero0}",
+            flush=True,
+        )
+        print(
+            f"[debug] size   {w}x{h}  alpha(255)={a_full0}  alpha(0)={a_zero0}",
             flush=True,
         )
         print(f"[debug] mode   {eff_mode}", flush=True)
 
-    t_u0 = time.perf_counter()
+    # palette restriction (single --limit flag behavior)
+    if limit_arg is None:
+        colours_mode = "full"
+        limit_opt = None
+    else:
+        colours_mode = "limited"
+        limit_opt = None if int(limit_arg) < 0 else int(limit_arg)
+
+    pal_rgb_sel, pal_lab_sel, pal_lch_sel, sel_idx = restrict_palette(
+        colours_mode,
+        rgb_in,
+        alpha,
+        pal_rgb,
+        pal_lab,
+        pal_lch,
+        name_of=name_of_hex,
+        limit_opt=limit_opt,
+        debug=debug,
+    )
+
+    t1 = time.perf_counter()
+
+    # quick uniques/debug before mapping
     uniq_rgb, counts = _unique_visible(rgb_in, alpha)
-    t_u1 = time.perf_counter()
     if debug:
+        # light "pixel" debug header regardless of mode (for consistency)
         print(
-            f"[debug] pixel size_in={w0}x{h0}  size_eff={w}x{h}  workers={workers}  time={_fmt_secs(t_u1 - t_u0)}",
+            f"[debug] pixel size_in={w0}x{h0}  size_eff={w}x{h}  workers={workers}  time={_fmt_secs(t1 - t_r1)}",
             flush=True,
         )
         if eff_mode == "pixel":
@@ -511,22 +388,29 @@ def _process_one(
                 f"[debug] uniques_visible={uniq_rgb.shape[0]}  top16_share={share:.3f}",
                 flush=True,
             )
-            
         else:
-            _print_debug_photo(uniq_rgb, counts, pal_rgb, pal_lab, name_of, top_k=20)
+            _print_debug_photo(
+                uniq_rgb, counts, pal_rgb_sel, pal_lab_sel, name_of_hex, top_k=20
+            )
 
-    t1 = time.perf_counter()
+    # map
     try:
         if eff_mode == "photo":
-            mapped = _call_photo_dither(
-                rgb_in, alpha, pal_rgb, pal_lab, pal_lch, workers, debug
+            # photo wants the selected PaletteItem list
+            items_sel = [items[i] for i in sel_idx.tolist()]
+            mapped = dither_photo(
+                rgb_in,
+                alpha,
+                items_sel,
+                pal_lab_sel,
+                pal_lch_sel,
+                workers=workers,
+                progress=debug,
             )
-        elif eff_mode == "bw":
-            mapped = _call_bw_dither(
-                rgb_in, alpha, pal_rgb, pal_lab, pal_lch, workers, debug
+        else:  # pixel
+            mapped = run_pixel(
+                rgb_in, alpha, pal_rgb_sel, pal_lab_sel, pal_lch_sel, debug=debug
             )
-        else:
-            mapped = run_pixel(rgb_in, alpha, pal_rgb, pal_lab, pal_lch, debug=debug)
 
         if isinstance(mapped, tuple):
             mapped = mapped[0]
@@ -546,7 +430,8 @@ def _process_one(
     except Exception as e:
         if debug:
             print(f"[debug] mapper failed ({e}); falling back to nearest", flush=True)
-        mapped = _map_nearest(rgb_in, alpha, pal_rgb, pal_lab)
+        mapped = _map_nearest(rgb_in, alpha, pal_rgb_sel, pal_lab_sel)
+
     t2 = time.perf_counter()
 
     _save_png_rgb_a(out_path, mapped, alpha)
@@ -554,11 +439,11 @@ def _process_one(
 
     print(f"Mode: {eff_mode}", flush=True)
     print(
-        f"Wrote {out_path.name} | size={w}x{h} | palette_size={len(pal_hex)}",
+        f"Wrote {out_path.name} | size={w}x{h} | palette_size={pal_rgb_sel.shape[0]}",
         flush=True,
     )
     print("Colours used:", flush=True)
-    for hhex, nm, cnt in _colour_usage_report(mapped, alpha, name_of):
+    for hhex, nm, cnt in _colour_usage_report(mapped, alpha, name_of_hex):
         print(f"  {hhex}  {nm}: {cnt}", flush=True)
     print(
         f"[debug] total  {_fmt_secs(t3 - t0)}  "
@@ -568,87 +453,85 @@ def _process_one(
     )
 
 
-# ----- streaming vs captured printing ----------------------------------------
-
-
+# ---------------- folder helpers ----------------
 def _process_one_captured(
-    p: Path,
+    path: Path,
     mode: str,
-    height: int | None,
-    resample_sel: str,
+    height: Optional[int],
+    resample: str,
     debug: bool,
     workers: int,
     pal_rgb: U8Image,
-    pal_hex: List[str],
-    name_of: NameOf,
     pal_lab: Lab,
     pal_lch: Lch,
-    outdir: Path | None,
+    items: List[PaletteItem],
+    name_of: NameOf,
+    limit_arg: Optional[int],
+    outdir: Optional[Path],
 ) -> str:
-    """Capture output for parallel jobs to avoid interleaving."""
     buf = io.StringIO()
     with redirect_stdout(buf):
-        print(f"\n=== {p.name} ===")
-        if p.stem.endswith("_wplace"):
+        if path.stem.endswith("_wplace"):
+            print(f"\n=== {path.name} ===")
             print("[debug] skipped output artifact (_wplace)")
             return buf.getvalue()
-        dst = (outdir / f"{p.stem}_wplace.png") if outdir else None
+        dst = (outdir / f"{path.stem}_wplace.png") if outdir else None
         _process_one(
-            src_path=p,
-            out_path=dst,
-            mode=mode,
-            height=height,
-            resample_sel=resample_sel,
-            debug=debug,
-            workers=workers,
-            pal_rgb=pal_rgb,
-            pal_hex=pal_hex,
-            name_of=name_of,
-            pal_lab=pal_lab,
-            pal_lch=pal_lch,
+            path,
+            dst,
+            mode,
+            height,
+            resample,
+            debug,
+            workers,
+            pal_rgb,
+            pal_lab,
+            pal_lch,
+            items,
+            name_of,
+            limit_arg,
         )
     return buf.getvalue()
 
 
 def _process_one_live(
-    p: Path,
+    path: Path,
     mode: str,
-    height: int | None,
+    height: Optional[int],
     resample_sel: str,
     debug: bool,
     workers: int,
     pal_rgb: U8Image,
-    pal_hex: List[str],
-    name_of: NameOf,
     pal_lab: Lab,
     pal_lch: Lch,
-    outdir: Path | None,
+    items: List[PaletteItem],
+    name_of_hex: NameOf,
+    limit_arg: Optional[int],
+    outdir: Optional[Path],
 ) -> None:
-    """Stream output live (no buffering)."""
-    print(f"\n=== {p.name} ===", flush=True)
-    if p.stem.endswith("_wplace"):
+    if path.stem.endswith("_wplace"):
+        print(f"\n=== {path.name} ===", flush=True)
         print("[debug] skipped output artifact (_wplace)", flush=True)
         return
-    dst = (outdir / f"{p.stem}_wplace.png") if outdir else None
+    dst = (outdir / f"{path.stem}_wplace.png") if outdir else None
     _process_one(
-        src_path=p,
-        out_path=dst,
-        mode=mode,
-        height=height,
-        resample_sel=resample_sel,
-        debug=debug,
-        workers=workers,
-        pal_rgb=pal_rgb,
-        pal_hex=pal_hex,
-        name_of=name_of,
-        pal_lab=pal_lab,
-        pal_lch=pal_lch,
+        path,
+        dst,
+        mode,
+        height,
+        resample_sel,
+        debug,
+        workers,
+        pal_rgb,
+        pal_lab,
+        pal_lch,
+        items,
+        name_of_hex,
+        limit_arg,
     )
 
 
-# ---------------- Main ----------------
-
-
+# ---------------- main ----------------
 def main() -> None:
     _enable_line_buffered_stdout()
     args = parse_args()
@@ -658,9 +541,7 @@ def main() -> None:
         print(f"error: not found: {src}", file=sys.stderr, flush=True)
         sys.exit(2)
 
-    pal_rgb, pal_hex, name_of = load_palette()
-    pal_lab: Lab = rgb_to_lab(pal_rgb.astype(np.float32))
-    pal_lch: Lch = lab_to_lch(pal_lab.astype(np.float32))
+    pal_rgb, pal_lab, pal_lch, items, name_of_hex = _build_palette_views()
 
     exts = {".png", ".jpg", ".jpeg", ".webp"}
     if src.is_dir():
@@ -684,14 +565,15 @@ def main() -> None:
                     p,
                     args.mode,
                     args.height,
-                    args.resample,  # effective choice decided per-file (after auto-pick)
+                    args.resample,
                     args.debug,
                     args.workers,
                     pal_rgb,
-                    pal_hex,
-                    name_of,
                     pal_lab,
                     pal_lch,
+                    items,
+                    name_of_hex,
+                    args.limit,
                     args.outdir,
                 )
         else:
@@ -706,10 +588,11 @@ def main() -> None:
                         args.debug,
                         args.workers,
                         pal_rgb,
-                        pal_hex,
-                        name_of,
                         pal_lab,
                         pal_lch,
+                        items,
+                        name_of_hex,
+                        args.limit,
                         args.outdir,
                     )
                     for p in files
@@ -717,7 +600,6 @@ def main() -> None:
                 blocks = [f.result() for f in futs]
             print("".join(blocks), end="", flush=True)
     else:
-        # Single file => always stream prints live
         _process_one_live(
             src,
             args.mode,
@@ -726,10 +608,11 @@ def main() -> None:
             args.debug,
             args.workers,
             pal_rgb,
-            pal_hex,
-            name_of,
             pal_lab,
             pal_lch,
+            items,
+            name_of_hex,
+            args.limit,
             args.outdir,
         )
 

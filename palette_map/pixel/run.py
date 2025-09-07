@@ -1,502 +1,469 @@
 # palette_map/pixel/run.py
 from __future__ import annotations
 
-import math
-from typing import Dict, List, Tuple
-
+from typing import List, Tuple, Dict
 import numpy as np
 
-from palette_map.core_types import U8Image, U8Mask, Lab, Lch, hue_diff_deg
-from palette_map.color_convert import rgb_to_lab, lab_to_lch
+from palette_map.core_types import U8Image, U8Mask, Lab, Lch
+from palette_map.colour_convert import rgb_to_lab, lab_to_lch, delta_e2000_vec
 
 
-# ----------------------------- ΔE2000 -----------------------------------------
+# ----------------- utilities --------------------------------------------------
 
 
-def ciede2000_pair(lab1: np.ndarray, lab2: np.ndarray) -> float:
-    L1, a1, b1 = float(lab1[0]), float(lab1[1]), float(lab1[2])
-    L2, a2, b2 = float(lab2[0]), float(lab2[1]), float(lab2[2])
-
-    C1 = math.hypot(a1, b1)
-    C2 = math.hypot(a2, b2)
-    Cm = 0.5 * (C1 + C2)
-    G = 0.5 * (1.0 - math.sqrt((Cm**7) / (Cm**7 + 25.0**7)))
-
-    a1p = (1.0 + G) * a1
-    a2p = (1.0 + G) * a2
-    C1p = math.hypot(a1p, b1)
-    C2p = math.hypot(a2p, b2)
-
-    h1p = (
-        0.0
-        if (a1p == 0.0 and b1 == 0.0)
-        else (math.degrees(math.atan2(b1, a1p)) % 360.0)
-    )
-    h2p = (
-        0.0
-        if (a2p == 0.0 and b2 == 0.0)
-        else (math.degrees(math.atan2(b2, a2p)) % 360.0)
-    )
-
-    dLp = L2 - L1
-    dCp = C2p - C1p
-
-    dh = h2p - h1p
-    if (C1p * C2p) == 0.0:
-        dhp = 0.0
-    elif dh > 180.0:
-        dhp = dh - 360.0
-    elif dh < -180.0:
-        dhp = dh + 360.0
-    else:
-        dhp = dh
-    dHp = 2.0 * math.sqrt(C1p * C2p) * math.sin(math.radians(0.5 * dhp))
-
-    Lpm = 0.5 * (L1 + L2)
-    Cpm = 0.5 * (C1p + C2p)
-
-    if (C1p * C2p) == 0.0:
-        hpm = h1p + h2p
-    else:
-        d = abs(h1p - h2p)
-        if d <= 180.0:
-            hpm = 0.5 * (h1p + h2p)
-        else:
-            hpm = 0.5 * (h1p + h2p + (360.0 if (h1p + h2p) < 360.0 else -360.0))
-
-    T = (
-        1.0
-        - 0.17 * math.cos(math.radians(hpm - 30.0))
-        + 0.24 * math.cos(math.radians(2.0 * hpm))
-        + 0.32 * math.cos(math.radians(3.0 * hpm + 6.0))
-        - 0.20 * math.cos(math.radians(4.0 * hpm - 63.0))
-    )
-    d_ro = 30.0 * math.exp(-(((hpm - 275.0) / 25.0) ** 2.0))
-    Rc = 2.0 * math.sqrt((Cpm**7) / (Cpm**7 + 25.0**7))
-
-    Sl = 1.0 + (0.015 * ((Lpm - 50.0) ** 2.0)) / math.sqrt(20.0 + (Lpm - 50.0) ** 2.0)
-    Sc = 1.0 + 0.045 * Cpm
-    Sh = 1.0 + 0.015 * Cpm * T
-    Rt = -math.sin(math.radians(2.0 * d_ro)) * Rc
-
-    return float(
-        math.sqrt(
-            (dLp / Sl) ** 2.0
-            + (dCp / Sc) ** 2.0
-            + (dHp / Sh) ** 2.0
-            + Rt * (dCp / Sc) * (dHp / Sh)
+def _unique_visible_with_inverse(
+    rgb: U8Image, alpha: U8Mask
+) -> Tuple[U8Image, np.ndarray, np.ndarray]:
+    vis = alpha > 0
+    if not np.any(vis):
+        return (
+            np.zeros((0, 3), dtype=np.uint8),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
         )
-    )
-
-
-# ------------------------------ helpers ----------------------------------------
-
-
-def _unique_visible(rgb: U8Image, alpha: U8Mask) -> Tuple[np.ndarray, np.ndarray]:
-    vis = alpha > 0
-    if not np.any(vis):
-        return np.empty((0, 3), np.uint8), np.empty((0,), np.int64)
     flat = rgb[vis].reshape(-1, 3)
-    uniq, counts = np.unique(flat, axis=0, return_counts=True)
-    return uniq.astype(np.uint8), counts.astype(np.int64)
-
-
-def _apply_mapping(
-    img_rgb: U8Image,
-    alpha: U8Mask,
-    src_uniq: np.ndarray,
-    tgt_rgb: np.ndarray,
-) -> U8Image:
-    out = img_rgb.copy()
-    vis = alpha > 0
-    if not np.any(vis):
-        return out
-
-    flat_vis = img_rgb[vis].reshape(-1, 3).astype(np.uint32, copy=False)
-    keys_vis = (flat_vis[:, 0] << 16) | (flat_vis[:, 1] << 8) | flat_vis[:, 2]
-    src_keys = (
-        (src_uniq[:, 0].astype(np.uint32) << 16)
-        | (src_uniq[:, 1].astype(np.uint32) << 8)
-        | src_uniq[:, 2].astype(np.uint32)
+    uniq, inv, counts = np.unique(flat, axis=0, return_inverse=True, return_counts=True)
+    return (
+        uniq.astype(np.uint8, copy=False),
+        counts.astype(np.int64, copy=False),
+        inv.astype(np.int64, copy=False),
     )
-    key_to_idx: Dict[int, int] = {int(k): i for i, k in enumerate(src_keys.tolist())}
-    idxs = np.fromiter(
-        (key_to_idx[int(k)] for k in keys_vis.tolist()),
-        count=keys_vis.size,
-        dtype=np.int32,
-    )
-    mapped = tgt_rgb[idxs]
-    out[vis] = mapped.reshape((-1, 3)).astype(np.uint8, copy=False)
-    return out
 
 
-def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+def _weighted_percentile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
     order = np.argsort(values)
     v = values[order]
     w = weights[order]
     cw = np.cumsum(w)
-    pos = q * float(cw[-1])
-    idx = int(np.searchsorted(cw, pos, side="left"))
-    idx = min(idx, len(v) - 1)
-    return float(v[idx])
+    if cw[-1] == 0:
+        return float(v[-1])
+    pos = q * cw[-1]
+    idx = np.searchsorted(cw, pos, side="left")
+    return float(v[min(idx, len(v) - 1)])
 
 
-def _de_matrix(src_lab: Lab, pal_lab: Lab) -> np.ndarray:
-    S, P = src_lab.shape[0], pal_lab.shape[0]
-    de = np.empty((S, P), dtype=np.float32)
-    for i in range(S):
-        for j in range(P):
-            de[i, j] = ciede2000_pair(src_lab[i], pal_lab[j])
-    return de
+def _prefilter_topk(s_lab: np.ndarray, pal_lab: Lab, k: int) -> np.ndarray:
+    diff = pal_lab - s_lab
+    de2 = np.sum(diff * diff, axis=1)
+    if k >= de2.shape[0]:
+        return np.argsort(de2)
+    idx = np.argpartition(de2, k)[:k]
+    return idx[np.argsort(de2[idx])]
 
 
-def _build_costs(
-    src_lch: Lch, pal_lch: Lch, base_de: np.ndarray, mode: str
-) -> np.ndarray:
-    S, P = base_de.shape
-    costs = base_de.astype(np.float32).copy()
-
-    sL = src_lch[:, 0][:, None]  # (S,1)
-    sC = src_lch[:, 1][:, None]  # (S,1)
-    tL = pal_lch[:, 0][None, :]  # (1,P)
-    tC = pal_lch[:, 1][None, :]  # (1,P)
-
-    if mode == "light":
-        costs += 0.03 * np.abs(tL - sL)
-
-    elif mode == "hue":
-        # pairwise hue penalty, scaled by source chroma so neutrals aren’t over-penalized
-        dh = np.empty((S, P), dtype=np.float32)
-        for i in range(S):
-            hi = float(src_lch[i, 2])
-            for j in range(P):
-                dh[i, j] = hue_diff_deg(hi, float(pal_lch[j, 2]))
-        hue_w = np.minimum(1.0, sC / 30.0)
-        costs += 0.12 * hue_w * (dh / 10.0)
-
-    elif mode == "chroma":
-        # discourage mapping to lower chroma than source
-        costs += 0.04 * np.maximum(0.0, sC - tC)
-
-    elif mode == "neutral":
-        # strongly prefer neutral→neutral, lightly tie-break by lightness
-        neutral_src = (sC <= 8.0).astype(np.float32)
-        neutral_tgt = (tC <= 12.0).astype(np.float32)
-        costs += (
-            0.30 * (1.0 - neutral_tgt) * neutral_src
-        )  # penalty if pushing neutral src to chroma tgt
-        costs -= 1.20 * (neutral_src * neutral_tgt)  # bonus for neutral→neutral
-        costs += 0.02 * neutral_src * np.abs(tL - sL)  # tie-break by L closeness
-
-    return costs
+def _hue_dist_deg(h1: float, h2: np.ndarray) -> np.ndarray:
+    dh = np.abs(h2 - h1)
+    return np.where(dh > 180.0, 360.0 - dh, dh)
 
 
-# -------- soft-unique + de-share that protects neutrals from blending ----------
+# ----------------- neutral / grey-ish detection ------------------------------
 
 
-def _assign_soft_unique(
-    costs: np.ndarray,
-    base_de: np.ndarray,
+def _neutral_indices(pal_lch: Lch) -> np.ndarray:
+    """
+    Build a neutral pool:
+      - Prefer chroma <= 10 (tight), else fall back to the lowest-chroma quartile.
+      - Always include darkest & brightest entries (for coverage).
+    """
+    C = pal_lch[:, 1].astype(np.float32, copy=False)
+    idx = np.where(C <= 10.0)[0]
+    if idx.size == 0:
+        q = float(np.quantile(C, 0.25))
+        idx = np.where(C <= q)[0]
+    if idx.size == 0:
+        lo = int(np.argmin(pal_lch[:, 0]))
+        hi = int(np.argmax(pal_lch[:, 0]))
+        return np.unique(np.array([lo, hi], dtype=int))
+    lo = int(np.argmin(pal_lch[:, 0]))
+    hi = int(np.argmax(pal_lch[:, 0]))
+    return np.unique(np.concatenate([idx, np.array([lo, hi], dtype=int)])).astype(int)
+
+
+def _greyish_sources(src_rgb: U8Image, src_lch: Lch) -> np.ndarray:
+    """
+    Tighter grey-ish gate:
+      - Small RGB channel spread (<= 20)
+      - Low-ish chroma (C <= 22)
+      - AND hue near a neutral axis (|h| or |h-180| <= 18°) unless C<=12
+    """
+    r = src_rgb[:, 0].astype(np.int16)
+    g = src_rgb[:, 1].astype(np.int16)
+    b = src_rgb[:, 2].astype(np.int16)
+    max_delta = np.maximum(np.maximum(np.abs(r - g), np.abs(g - b)), np.abs(r - b))
+    C = src_lch[:, 1]
+    H = src_lch[:, 2]
+    # distance to neutral axes (0°, 180°)
+    d0 = np.minimum(H, 360.0 - H)
+    d180 = np.minimum(np.abs(H - 180.0), 360.0 - np.abs(H - 180.0))
+    near_neutral_axis = (np.minimum(d0, d180) <= 18.0) | (C <= 12.0)
+    return (max_delta <= 20) & (C <= 22.0) & near_neutral_axis
+
+
+# ----------------- multi-run (baseline behaviour) ----------------------------
+
+
+def _score_one_run(
+    src_rgb: U8Image,
+    src_lab: Lab,
     src_lch: Lch,
+    pal_lab: Lab,
     pal_lch: Lch,
-    counts: np.ndarray,
+    *,
+    flavor: str,
+    topk: int,
 ) -> np.ndarray:
-    S, _ = costs.shape
-    order = np.argsort(-counts)  # large areas first
-    assigned = -np.ones(S, dtype=np.int32)
-    used: set[int] = set()
+    P = pal_lab.shape[0]
+    Ns = src_lab.shape[0]
+    out = np.empty((Ns,), dtype=np.int32)
 
-    sC = src_lch[:, 1]
-    tC_all = pal_lch[:, 1]
+    for i in range(Ns):
+        sL = float(src_lch[i, 0])
+        sC = float(src_lch[i, 1])
+        sh = float(src_lch[i, 2])
 
-    SRC_NEUTRAL = 10.0
-    TGT_NEUTRAL = 12.0
-    UNIQUE_TOL = 1.25
-    UNIQUE_TOL_NEUTRAL = 2.75  # allow a bigger ΔE rise to keep neutrals distinct
+        idxs = _prefilter_topk(src_lab[i], pal_lab, min(topk, P))
+        cand_lab = pal_lab[idxs]
+        cand_lch = pal_lch[idxs]
 
-    for i in order:
-        row = costs[i]
-        ranked = np.argsort(row)
-        j_best = int(ranked[0])
+        dE = delta_e2000_vec(src_lab[i], cand_lab).astype(np.float32, copy=False)
+        cost = dE.copy()
 
-        j_unused = next((int(j) for j in ranked if j not in used), None)
-        if j_unused is None:
-            assigned[i] = j_best
-            used.add(j_best)
-            continue
+        cL = cand_lch[:, 0]
+        cC = cand_lch[:, 1]
+        cH = cand_lch[:, 2]
 
-        de_best = float(base_de[i, j_best])
-        de_unused = float(base_de[i, j_unused])
+        if flavor == "light":
+            cost += 0.15 * np.abs(cL - sL).astype(np.float32)
+        elif flavor == "hue":
+            hue_w = min(1.0, sC / 40.0)
+            dh = (_hue_dist_deg(sh, cH) / 180.0).astype(np.float32)
+            cost += 0.08 * hue_w * dh
+        elif flavor == "chroma":
+            cost += 0.06 * np.abs(cC - sC).astype(np.float32)
+        elif flavor == "neutral":
+            if sC < 12.0:
+                cost += 0.6 * np.maximum(0.0, cC - sC).astype(np.float32)
+                cost += (cC > 16.0).astype(np.float32) * 3.0
 
-        src_is_neutral = float(sC[i]) <= SRC_NEUTRAL
-        best_is_neutral = float(tC_all[j_best]) <= TGT_NEUTRAL
-        unused_is_chroma = float(tC_all[j_unused]) > TGT_NEUTRAL
+        out[i] = int(idxs[int(np.argmin(cost))])
 
-        tol = UNIQUE_TOL_NEUTRAL if src_is_neutral else UNIQUE_TOL
-        take_unused = (de_unused <= de_best + tol) and not (
-            src_is_neutral and best_is_neutral and unused_is_chroma
+    return out
+
+
+def _ensemble_pick(
+    src_lab: Lab,
+    src_lch: Lch,
+    pal_lab: Lab,
+    pal_lch: Lch,
+    choices: List[np.ndarray],
+) -> np.ndarray:
+    Ns = src_lab.shape[0]
+    out = np.empty((Ns,), dtype=np.int32)
+    tH_all = pal_lch[:, 2]
+
+    for i in range(Ns):
+        cand_js = np.array([c[i] for c in choices], dtype=np.int32)
+        cand_labs = pal_lab[cand_js]
+        dEs = np.array(
+            [
+                delta_e2000_vec(src_lab[i], cand_labs[j : j + 1])[0]
+                for j in range(cand_labs.shape[0])
+            ],
+            dtype=np.float32,
         )
+        best = int(np.argmin(dEs))
+        j_best = int(cand_js[best])
+        de_best = float(dEs[best])
 
-        if take_unused:
-            assigned[i] = j_unused
-            used.add(j_unused)
-        else:
-            assigned[i] = j_best
-            used.add(j_best)
+        near = dEs <= (de_best + 0.10)
+        if np.count_nonzero(near) > 1:
+            sH = float(src_lch[i, 2])
+            js = cand_js[near]
+            dh = np.abs(_hue_dist_deg(sH, tH_all[js]))
+            j_best = int(js[int(np.argmin(dh))])
 
-    return assigned
+        out[i] = j_best
+
+    return out
 
 
-def _break_shares_neutral_aware(
-    assigned: np.ndarray,
-    base_de: np.ndarray,
+# ----------------- unique neutral assignment for grey-ish --------------------
+
+
+def _greedy_unique_greys(
+    grey_idx: np.ndarray,
+    neutral_idx: np.ndarray,
+    src_lab: Lab,
     src_lch: Lch,
-    pal_lch: Lch,
     counts: np.ndarray,
-) -> np.ndarray:
-    S = assigned.size
-    used = set(int(j) for j in assigned.tolist())
-    groups: Dict[int, List[int]] = {}
-    for i, j in enumerate(assigned.tolist()):
-        groups.setdefault(int(j), []).append(i)
-
-    SRC_NEUTRAL = 10.0
-    TGT_NEUTRAL = 12.0
-    MAX_DE_INCREASE_NEUTRAL = 3.0  # more generous for neutrals
-    MAX_DE_INCREASE_CHROMA = 1.5
-
-    chip_weight: Dict[int, int] = {}
-    for j, idxs in groups.items():
-        chip_weight[j] = int(np.sum(counts[idxs])) if len(idxs) > 1 else 0
-
-    for chip, idxs in sorted(groups.items(), key=lambda kv: -chip_weight[kv[0]]):
-        if len(idxs) < 2:
-            continue
-        idxs_sorted = sorted(idxs, key=lambda i: float(base_de[i, chip]))
-        keep = idxs_sorted[0]
-        for i in idxs_sorted[1:]:
-            cur_de = float(base_de[i, chip])
-            src_neutral = float(src_lch[i, 1]) <= SRC_NEUTRAL
-            tol = MAX_DE_INCREASE_NEUTRAL if src_neutral else MAX_DE_INCREASE_CHROMA
-
-            # search for best unused alternative under tolerance
-            for j_alt in np.argsort(base_de[i]).tolist():
-                if j_alt == chip or j_alt in used:
-                    continue
-                tgt_neutral = float(pal_lch[j_alt, 1]) <= TGT_NEUTRAL
-                if src_neutral and not tgt_neutral:
-                    continue  # keep neutrals on neutral chips
-                new_de = float(base_de[i, j_alt])
-                if new_de <= cur_de + tol:
-                    assigned[i] = int(j_alt)
-                    used.add(int(j_alt))
-                    break  # moved
-            # else keep sharing
-
-    return assigned
-
-
-def _deshare_neutrals_global(
-    assigned: np.ndarray,
-    base_de: np.ndarray,
-    src_lch: Lch,
+    pal_lab: Lab,
     pal_lch: Lch,
-    counts: np.ndarray,
-) -> np.ndarray:
-    """Global pass: move neutral sources to unused neutral chips if ΔE rise is small."""
-    S = assigned.size
-    used = set(int(j) for j in assigned.tolist())
-    SRC_NEUTRAL = 10.0
-    TGT_NEUTRAL = 12.0
-    TOL = 3.0
+) -> Dict[int, int]:
+    """
+    Assign grey-ish sources to distinct neutral palette entries *when safe*.
 
-    # build candidate moves (delta, large count first negative, i, j_alt)
-    moves: List[Tuple[float, int, int, int]] = []
-    for i in range(S):
-        if float(src_lch[i, 1]) > SRC_NEUTRAL:
+    Gates:
+      - L* proximity: consider only unused neutrals with |ΔL| <= 22
+      - ΔE proximity: force uniqueness only if an unused neutral is within +2.0 ΔE of
+        the *best neutral* for that source.
+      - Chromatic escape hatch: if the *global best* (over the whole palette) beats the
+        best neutral by > 0.75 ΔE, use the global best instead (don't force a neutral).
+    """
+    mapping: Dict[int, int] = {}
+    if grey_idx.size == 0 or neutral_idx.size == 0:
+        return mapping
+
+    order = np.argsort(-counts[grey_idx])
+    taken: set[int] = set()
+    palL = pal_lch[:, 0].astype(np.float32, copy=False)
+
+    for k in order:
+        i = int(grey_idx[k])
+
+        # --- compare best-neutral vs best-overall
+        de_neu_all = delta_e2000_vec(src_lab[i], pal_lab[neutral_idx]).astype(
+            np.float32, copy=False
+        )
+        r_neu_best = int(np.argmin(de_neu_all))
+        j_neu_best = int(neutral_idx[r_neu_best])
+        de_neu_best = float(de_neu_all[r_neu_best])
+
+        de_full_all = delta_e2000_vec(src_lab[i], pal_lab).astype(
+            np.float32, copy=False
+        )
+        j_full_best = int(np.argmin(de_full_all))
+        de_full_best = float(de_full_all[j_full_best])
+
+        # if a chromatic (or any) palette entry is clearly better than any neutral, prefer it
+        if de_full_best + 0.75 < de_neu_best:
+            mapping[i] = j_full_best
+            # don't mark as taken: we didn't consume a neutral
             continue
-        j_cur = int(assigned[i])
-        cur_de = float(base_de[i, j_cur])
-        # if already unique neutral, skip
-        if float(pal_lch[j_cur, 1]) <= TGT_NEUTRAL and (
-            assigned.tolist().count(j_cur) == 1
-        ):
-            continue
-        # best unused neutral
-        for j_alt in np.argsort(base_de[i]).tolist():
-            if float(pal_lch[j_alt, 1]) > TGT_NEUTRAL:
+
+        # otherwise, try to give each grey a unique *neutral* when it doesn't hurt
+        # respect L* proximity and uniqueness
+        Ls = float(src_lch[i, 0])
+        dL_neu_all = np.abs(palL[neutral_idx] - Ls)
+        mask_unused = np.array(
+            [int(neutral_idx[r]) not in taken for r in range(neutral_idx.size)],
+            dtype=bool,
+        )
+        allowed = np.where(mask_unused & (dL_neu_all <= 22.0))[0]
+
+        if allowed.size > 0:
+            r_allowed = allowed[int(np.argmin(de_neu_all[allowed]))]
+            j_allowed = int(neutral_idx[r_allowed])
+            de_allowed = float(de_neu_all[r_allowed])
+
+            # only force uniqueness if it's close to the best-neutral
+            if de_allowed <= (de_neu_best + 2.0):
+                mapping[i] = j_allowed
+                taken.add(j_allowed)
                 continue
-            if j_alt in used:
-                continue
-            new_de = float(base_de[i, j_alt])
-            delta = new_de - cur_de
-            if delta <= TOL:
-                moves.append((delta, -int(counts[i]), i, int(j_alt)))
-                break
 
-    moves.sort()
-    for _, _, i, j in moves:
-        if j in used:
-            continue
-        assigned[i] = j
-        used.add(j)
-    return assigned
+        # fallback: use the best-neutral (even if reusing)
+        mapping[i] = j_neu_best
+        taken.add(j_neu_best)
+
+    return mapping
 
 
-# ---------------------- single run, ensemble, and selection --------------------
+# ----------------- gentle whole-palette decongestion -------------------------
 
 
-def _run_variant(
-    mode: str,
-    base_de: np.ndarray,
-    src_lch: Lch,
-    pal_lch: Lch,
+def _light_decongest(
+    chosen_idx: np.ndarray,
+    src_lab: Lab,
     counts: np.ndarray,
-) -> Tuple[np.ndarray, float, float, float, int]:
-    costs = _build_costs(src_lch, pal_lch, base_de, mode)
-    assigned = _assign_soft_unique(costs, base_de, src_lch, pal_lch, counts)
-    assigned = _break_shares_neutral_aware(assigned, base_de, src_lch, pal_lch, counts)
-    assigned = _deshare_neutrals_global(assigned, base_de, src_lch, pal_lch, counts)
+    pal_lab: Lab,
+) -> np.ndarray:
+    Ns = chosen_idx.size
+    out = chosen_idx.copy()
+    used: Dict[int, int] = {}
+    for j in out:
+        used[int(j)] = used.get(int(j), 0) + 1
 
-    S = base_de.shape[0]
-    de = np.array([base_de[i, int(assigned[i])] for i in range(S)], dtype=np.float32)
-    mean_de = float(np.average(de, weights=counts))
-    p90 = _weighted_quantile(de, counts, 0.90)
-    mxx = float(np.max(de)) if S else 0.0
-
-    hist: Dict[int, int] = {}
-    for j in assigned.tolist():
-        hist[j] = hist.get(j, 0) + 1
-    shares = sum(1 for v in hist.values() if v > 1)
-    return assigned, mean_de, p90, mxx, shares
-
-
-def _ensemble_assign(
-    assigned_runs: List[np.ndarray],
-    base_de: np.ndarray,
-    counts: np.ndarray,
-    src_lch: Lch,
-    pal_lch: Lch,
-) -> Tuple[np.ndarray, float, float, float, int]:
-    S = base_de.shape[0]
-    cand: List[List[int]] = [list({int(r[i]) for r in assigned_runs}) for i in range(S)]
-    for i in range(S):
-        if not cand[i]:
-            cand[i] = [int(np.argmin(base_de[i]))]
+    budgets = np.empty((Ns,), dtype=np.float32)
+    for i in range(Ns):
+        j0 = int(out[i])
+        de_best = float(delta_e2000_vec(src_lab[i], pal_lab[j0 : j0 + 1])[0])
+        budgets[i] = min(0.8, max(0.35, 0.45 + 0.05 * de_best))
 
     order = np.argsort(-counts)
-    assigned = -np.ones(S, dtype=np.int32)
-    used: set[int] = set()
-
+    all_js = np.arange(pal_lab.shape[0], dtype=np.int32)
     for i in order:
-        de_vals = sorted(
-            ((j, float(base_de[i, j])) for j in cand[i]), key=lambda x: x[1]
-        )
-        j_pick = next((j for j, _ in de_vals if j not in used), None)
-        if j_pick is None:
-            j_pick = de_vals[0][0]  # share for now
-        assigned[i] = j_pick
-        used.add(j_pick)
+        j0 = int(out[i])
+        if used.get(j0, 0) <= 1:
+            continue
+        de_all = delta_e2000_vec(src_lab[i], pal_lab).astype(np.float32, copy=False)
+        de0 = float(de_all[j0])
+        mask = de_all <= (de0 + budgets[i])
+        cand = all_js[mask]
+        cand = np.array([j for j in cand if used.get(int(j), 0) == 0], dtype=np.int32)
+        if cand.size == 0:
+            continue
+        j_new = int(cand[int(np.argmin(de_all[cand]))])
+        out[i] = j_new
+        used[j0] -= 1
+        used[j_new] = 1
 
-    assigned = _break_shares_neutral_aware(assigned, base_de, src_lch, pal_lch, counts)
-
-    de = np.array([base_de[i, int(assigned[i])] for i in range(S)], dtype=np.float32)
-    mean_de = float(np.average(de, weights=counts))
-    p90 = _weighted_quantile(de, counts, 0.90)
-    mxx = float(np.max(de)) if S else 0.0
-    hist: Dict[int, int] = {}
-    for j in assigned.tolist():
-        hist[j] = hist.get(j, 0) + 1
-    shares = sum(1 for v in hist.values() if v > 1)
-    return assigned, mean_de, p90, mxx, shares
+    return out
 
 
-def _pick_final(
-    single_runs: List[Tuple[str, np.ndarray, float, float, float, int]],
-    ensemble: Tuple[np.ndarray, float, float, float, int],
-) -> Tuple[str, np.ndarray, float, float, float, int]:
-    best_idx = min(range(len(single_runs)), key=lambda k: single_runs[k][2])
-    best = single_runs[best_idx]
-    ens_assigned, ens_mean, ens_p90, ens_max, ens_shares = ensemble
-    _, _, b_mean, b_p90, b_max, b_shares = best
-    if (ens_mean <= b_mean) or (ens_p90 + 0.5 < b_p90) or (ens_max + 1.0 < b_max):
-        return ("ensemble", ens_assigned, ens_mean, ens_p90, ens_max, ens_shares)
-    return (
-        f"single:{single_runs[best_idx][0]}",
-        best[1],
-        b_mean,
-        b_p90,
-        b_max,
-        b_shares,
-    )
-
-
-# ----------------------------------- main --------------------------------------
+# ----------------- public entry ----------------------------------------------
 
 
 def run_pixel(
-    rgb_in: U8Image,
+    img_rgb: U8Image,
     alpha: U8Mask,
-    pal_rgb: np.ndarray,
+    pal_rgb: U8Image,
     pal_lab: Lab,
     pal_lch: Lch,
+    *,
     debug: bool = False,
+    workers: int = 1,  # signature compatibility
 ) -> U8Image:
-    uniq_rgb, counts = _unique_visible(rgb_in, alpha)
-    if uniq_rgb.size == 0:
-        return rgb_in
+    uniq_rgb, counts, inv = _unique_visible_with_inverse(img_rgb, alpha)
+    if uniq_rgb.shape[0] == 0:
+        return img_rgb.copy()
 
-    src_lab: Lab = rgb_to_lab(uniq_rgb.astype(np.float32))
-    src_lch: Lch = lab_to_lch(src_lab.astype(np.float32))
-    base_de = _de_matrix(src_lab, pal_lab)
+    s_lab = rgb_to_lab(uniq_rgb.astype(np.float32))
+    s_lch = lab_to_lch(s_lab)
 
-    modes = ["base", "light", "hue", "chroma", "neutral"]
-    single_runs: List[Tuple[str, np.ndarray, float, float, float, int]] = []
-    assigned_runs: List[np.ndarray] = []
+    P = int(pal_lab.shape[0])
+    topk = 16 if P >= 32 else max(8, P // 2)
 
-    for m in modes:
-        a, mean_de, p90, mxx, shares = _run_variant(
-            m, base_de, src_lch, pal_lch, counts
+    # multi-run flavours
+    flavors = ["base", "light", "hue", "chroma", "neutral"]
+    per_run_idx: List[np.ndarray] = []
+    stats = []
+    for fl in flavors:
+        idx = _score_one_run(
+            uniq_rgb,
+            s_lab,
+            s_lch,
+            pal_lab.astype(np.float32),
+            pal_lch.astype(np.float32),
+            flavor=fl,
+            topk=topk,
         )
-        single_runs.append((m, a, mean_de, p90, mxx, shares))
-        assigned_runs.append(a)
-        if debug:
-            print(
-                f"[debug] run {m:7s}  mean dE={mean_de:.3f}  p90={p90:.2f}  max={mxx:.2f}  shares={shares}",
-                flush=True,
-            )
-
-    ens = _ensemble_assign(assigned_runs, base_de, counts, src_lch, pal_lch)
-    tag, assigned, f_mean, f_p90, f_max, f_shares = _pick_final(single_runs, ens)
-
-    if debug:
-        print(
-            f"[debug] chosen {tag}  mean dE={f_mean:.3f}  p90={f_p90:.2f}  max={f_max:.2f}  shares={f_shares}",
-            flush=True,
-        )
-        de_chosen = np.array(
-            [base_de[i, int(assigned[i])] for i in range(base_de.shape[0])],
+        per_run_idx.append(idx)
+        labs = pal_lab[idx]
+        dE = np.array(
+            [
+                delta_e2000_vec(s_lab[i], labs[i : i + 1])[0]
+                for i in range(s_lab.shape[0])
+            ],
             dtype=np.float32,
         )
-        order = np.argsort(-de_chosen)
-        top = order[: min(12, order.size)]
-        print("[debug] important mappings:", flush=True)
-        for i in top:
-            j = int(assigned[i])
-            sL, sC, sh = [float(x) for x in src_lch[i]]
-            tL, tC, th = [float(x) for x in pal_lch[j]]
-            dh = hue_diff_deg(sh, th)
-            sr = uniq_rgb[i]
-            tr = pal_rgb[j]
+        mean_dE = float(np.average(dE, weights=counts))
+        p90 = _weighted_percentile(dE, counts, 0.90)
+        mx = float(dE.max()) if dE.size else 0.0
+        shares = int(uniq_rgb.shape[0] - np.unique(idx).size)
+        stats.append((fl, mean_dE, p90, mx, shares))
+
+    chosen = _ensemble_pick(
+        s_lab,
+        s_lch,
+        pal_lab.astype(np.float32),
+        pal_lch.astype(np.float32),
+        per_run_idx,
+    )
+
+    # --- Stage 1: safe unique assignment for grey-ish vs neutrals -------------
+    grey_mask = _greyish_sources(uniq_rgb, s_lch)
+    g_idx = np.where(grey_mask)[0]
+    neutrals = _neutral_indices(pal_lch.astype(np.float32))
+    g_map = _greedy_unique_greys(
+        g_idx,
+        neutrals,
+        s_lab,
+        s_lch,
+        counts,
+        pal_lab.astype(np.float32),
+        pal_lch.astype(np.float32),
+    )
+
+    chosen2 = chosen.copy()
+    for si, pj in g_map.items():
+        chosen2[int(si)] = int(pj)
+
+    # --- Stage 2: gentle decongestion across the rest -------------------------
+    chosen3 = _light_decongest(chosen2, s_lab, counts, pal_lab.astype(np.float32))
+
+    # ---- debug prints --------------------------------------------------------
+    if debug:
+        for fl, md, p90, mx, sh in stats:
             print(
-                f"  src #{sr[0]:02x}{sr[1]:02x}{sr[2]:02x}  "
-                f"count={int(counts[i]):4d} -> "
-                f"#{tr[0]:02x}{tr[1]:02x}{tr[2]:02x}  "
-                f"[dE={de_chosen[i]:5.2f}, dL={tL-sL:+6.3f}, dC={tC-sC:+6.3f}, dh={dh:4.1f} deg]",
+                f"[debug] run {fl:<12} mean dE={md:.3f}  p90={p90:.2f}  max={mx:.2f}  shares={sh}",
                 flush=True,
             )
 
-    tgt = np.zeros_like(uniq_rgb, dtype=np.uint8)
-    for i in range(uniq_rgb.shape[0]):
-        tgt[i] = pal_rgb[int(assigned[i])]
-    return _apply_mapping(rgb_in, alpha, uniq_rgb, tgt)
+        labs_fin = pal_lab[chosen3]
+        dE_fin = np.array(
+            [
+                delta_e2000_vec(s_lab[i], labs_fin[i : i + 1])[0]
+                for i in range(s_lab.shape[0])
+            ],
+            dtype=np.float32,
+        )
+        md = float(np.average(dE_fin, weights=counts))
+        p90 = _weighted_percentile(dE_fin, counts, 0.90)
+        mx = float(dE_fin.max()) if dE_fin.size else 0.0
+        sh = int(uniq_rgb.shape[0] - np.unique(chosen3).size)
+        print(
+            f"[debug] chosen ensemble  mean dE={md:.3f}  p90={p90:.2f}  max={mx:.2f}  shares={sh}",
+            flush=True,
+        )
+
+        # “important mappings” (top 12 by ΔE)
+        t_lab = pal_lab[chosen3]
+        t_lch = lab_to_lch(t_lab.astype(np.float32))
+        order = np.argsort(
+            -np.array(
+                [
+                    delta_e2000_vec(s_lab[i], t_lab[i : i + 1])[0]
+                    for i in range(s_lab.shape[0])
+                ]
+            )
+        )[:12]
+        if order.size > 0:
+            print("[debug] important mappings:", flush=True)
+            for i in order:
+                sr = uniq_rgb[i]
+                tr = pal_rgb[chosen3[i]]
+                sL, sC, shh = float(s_lch[i, 0]), float(s_lch[i, 1]), float(s_lch[i, 2])
+                tL, tC, th = float(t_lch[i, 0]), float(t_lch[i, 1]), float(t_lch[i, 2])
+                dh = th - shh
+                while dh > 180.0:
+                    dh -= 360.0
+                while dh < -180.0:
+                    dh += 360.0
+                print(
+                    f"  src #{sr[0]:02x}{sr[1]:02x}{sr[2]:02x}  count={int(counts[i]):5d} "
+                    f"-> #{tr[0]:02x}{tr[1]:02x}{tr[2]:02x}  "
+                    f"[dE={delta_e2000_vec(s_lab[i], t_lab[i:i+1])[0]:5.2f}, "
+                    f"dL={tL - sL:+6.3f}, dC={tC - sC:+6.3f}, dh={dh:4.1f} deg]",
+                    flush=True,
+                )
+
+        if g_idx.size:
+            # how many actually landed on neutral entries?
+            neutral_set = set(
+                int(j) for j in _neutral_indices(pal_lch.astype(np.float32))
+            )
+            assigned_neutral = sum(
+                1 for si, pj in g_map.items() if int(pj) in neutral_set
+            )
+            print(
+                f"[debug] grey unique assign: {assigned_neutral}/{g_idx.size} greys mapped to distinct neutrals",
+                flush=True,
+            )
+
+    # ---- materialise per-pixel ----------------------------------------------
+    out = img_rgb.copy()
+    vis = alpha > 0
+    if np.any(vis):
+        pal_map_rgb = pal_rgb[chosen3]
+        out[vis] = pal_map_rgb[inv].astype(np.uint8, copy=False)
+    return out

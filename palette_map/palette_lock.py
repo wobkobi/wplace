@@ -5,7 +5,7 @@ from typing import Iterator, List, Optional, Set, Tuple, Dict
 
 import numpy as np
 
-from .color_convert import rgb_to_lab
+from .colour_convert import rgb_to_lab
 from .core_types import RGBTuple, PaletteItem, U8Image, U8Mask, Lab
 
 

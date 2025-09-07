@@ -1,17 +1,15 @@
 # palette_map/photo/dither.py
 # --- Textured photo dither (drop-in) -----------------------------------------
-# Compatible with your wrappers. Accepts a palette list whose items have `.rgb`,
-# and Lab/LCh matrices aligned to that palette order. Threaded precompute.
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import math
 import sys
 import time
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
-from palette_map.color_convert import rgb_to_lab
+from palette_map.colour_convert import delta_e2000_vec, rgb_to_lab
 from palette_map.core_types import (
     U8Image,
     U8Mask,
@@ -20,7 +18,7 @@ from palette_map.core_types import (
     PaletteItem,
 )
 
-# ---- Tunables (safe defaults; adjust later if you want) ----
+# ---- Tunables ---------------------------------------------------------------
 BLUR_RADIUS = 2
 GRAD_K = 5.0
 PHOTO_TOPK = 12
@@ -45,8 +43,42 @@ NEAR_NEUTRAL_C = 2.5
 NEAR_BLACK_L = 10.0
 NEAR_WHITE_L = 92.0
 
+# gentle guards for metals/near-neutrals
+W_NEUTRAL_GUARD = 0.05
+W_LIGHTNESS_LOCK = 0.03
 
-# ---------- small threaded helpers (precompute only; diffusion stays serial) --
+# tiny decision cache quantization
+Q_L = 1.0
+Q_AB = 2.0
+Q_LLOC = 1.0
+Q_WLOC = 0.1
+
+# --- micro-mix (2-colour texturing) ------------------------------------------
+MIX_ENABLE = True  # set False to disable mixing entirely
+MIX_TOPK = 6  # choose pair from the best K candidates
+MIX_MIN_DE_GAIN = 0.15  # require at least this ΔE2000 gain vs single best
+MIX_LOCK_NEUTRALS = True  # if near_extreme_neutral, force pair to neutrals too
+
+# 8×8 Bayer thresholds in [0..64); we normalize to [0,1)
+_BAYER8 = (
+    np.array(
+        [
+            [0, 48, 12, 60, 3, 51, 15, 63],
+            [32, 16, 44, 28, 35, 19, 47, 31],
+            [8, 56, 4, 52, 11, 59, 7, 55],
+            [40, 24, 36, 20, 43, 27, 39, 23],
+            [2, 50, 14, 62, 1, 49, 13, 61],
+            [34, 18, 46, 30, 33, 17, 45, 29],
+            [10, 58, 6, 54, 9, 57, 5, 53],
+            [42, 26, 38, 22, 41, 25, 37, 21],
+        ],
+        dtype=np.float32,
+    )
+    / 64.0
+)
+
+
+# ---------- threaded precompute ----------------------------------------------
 
 
 def _split_rows(h: int, parts: int) -> List[Tuple[int, int]]:
@@ -69,11 +101,6 @@ def _rgb_to_lab_threaded(rgb: U8Image, workers: int) -> Lab:
 # ----------------------- image space utilities --------------------------------
 
 
-def compute_L_image(rgb: U8Image) -> np.ndarray:
-    # Lab L channel from sRGB
-    return rgb_to_lab(rgb)[..., 0].astype(np.float32, copy=False)
-
-
 def box_blur_2d(arr: np.ndarray, radius: int) -> np.ndarray:
     if radius <= 0:
         return arr.astype(np.float32, copy=False)
@@ -82,8 +109,8 @@ def box_blur_2d(arr: np.ndarray, radius: int) -> np.ndarray:
     ii = np.cumsum(np.cumsum(arr, axis=0), axis=1)
     ii_pad = np.zeros((H + 1, W + 1), dtype=np.float32)
     ii_pad[1:, 1:] = ii
-    ys = np.arange(H)[:, None]
-    xs = np.arange(W)[None, :]
+    ys = np.arange(H, dtype=np.int32)[:, None]
+    xs = np.arange(W, dtype=np.int32)[None, :]
     y1 = np.clip(ys - radius, 0, H - 1)
     y2 = np.clip(ys + radius, 0, H - 1)
     x1 = np.clip(xs - radius, 0, W - 1)
@@ -134,62 +161,6 @@ def prefilter_topk(s_lab: np.ndarray, pal_lab_mat: Lab, k: int) -> np.ndarray:
     return idx[np.argsort(de2[idx])]
 
 
-def ciede2000_vec(s: np.ndarray, cand: Lab) -> np.ndarray:
-    L1, a1, b1 = s[0], s[1], s[2]
-    L2, a2, b2 = cand[:, 0], cand[:, 1], cand[:, 2]
-    C1 = np.hypot(a1, b1)
-    C2 = np.hypot(a2, b2)
-    Cm = 0.5 * (C1 + C2)
-    G = 0.5 * (1 - np.sqrt((Cm**7) / (Cm**7 + 25**7)))
-    a1p = (1 + G) * a1
-    a2p = (1 + G) * a2
-    C1p = np.hypot(a1p, b1)
-    C2p = np.hypot(a2p, b2)
-    h1p = (np.degrees(np.atan2(b1, a1p)) + 360.0) % 360.0
-    h2p = (np.degrees(np.atan2(b2, a2p)) + 360.0) % 360.0
-    dLp = L2 - L1
-    dhp = h2p - h1p
-    dhp = np.where((C1p * C2p) == 0, 0.0, dhp)
-    dhp = np.where(dhp > 180.0, dhp - 360.0, dhp)
-    dhp = np.where(dhp < -180.0, dhp + 360.0, dhp)
-    dHp = 2.0 * np.sqrt(C1p * C2p) * np.sin(np.radians(dhp) / 2.0)
-    Lpm = 0.5 * (L1 + L2)
-    Cpm = 0.5 * (C1p + C2p)
-    hpm = np.where(
-        (C1p * C2p) == 0,
-        h1p + h2p,
-        np.where(
-            np.abs(h1p - h2p) <= 180.0,
-            0.5 * (h1p + h2p),
-            np.where(
-                (h1p + h2p) < 360.0,
-                0.5 * (h1p + h2p + 360.0),
-                0.5 * (h1p + h2p - 360.0),
-            ),
-        ),
-    )
-    T = (
-        1
-        - 0.17 * np.cos(np.radians(hpm - 30))
-        + 0.24 * np.cos(np.radians(2 * hpm))
-        + 0.32 * np.cos(np.radians(3 * hpm + 6))
-        - 0.20 * np.cos(np.radians(4 * hpm - 63))
-    )
-    d_ro = 30.0 * np.exp(-(((hpm - 275.0) / 25.0) ** 2))
-    Rc = 2.0 * np.sqrt((Cpm**7) / (Cpm**7 + 25**7))
-    Sl = 1.0 + (0.015 * ((Lpm - 50.0) ** 2)) / np.sqrt(20.0 + (Lpm - 50.0) ** 2)
-    Sc = 1.0 + 0.045 * Cpm
-    Sh = 1.0 + 0.015 * Cpm * T
-    Rt = -np.sin(np.radians(2.0 * d_ro)) * Rc
-    dCp = C2p - C1p
-    return np.sqrt(
-        (dLp / Sl) ** 2
-        + (dCp / Sc) ** 2
-        + (dHp / Sh) ** 2
-        + Rt * (dCp / Sc) * (dHp / Sh)
-    ).astype(np.float32, copy=False)
-
-
 def photo_cost_components(
     s_lab: np.ndarray,
     s_lch: np.ndarray,
@@ -201,7 +172,7 @@ def photo_cost_components(
     tL, tC, th = t_lch[:, 0], t_lch[:, 1], t_lch[:, 2]
     cost = np.zeros_like(tL, dtype=np.float32)
 
-    # preserve relative local contrast to blurred L
+    # local contrast preservation
     cost += W_LOCAL_BASE * w_local_eff * np.abs((tL - L_local) - (sL - L_local))
 
     d_s = abs(sL - L_local)
@@ -228,7 +199,7 @@ def photo_cost_components(
     return cost, tC
 
 
-def nearest_palette_idx_photo_lab_prefilter_vec(
+def _nearest_idx_photo(
     s_lab: np.ndarray,
     s_lch: np.ndarray,
     L_local: float,
@@ -237,19 +208,31 @@ def nearest_palette_idx_photo_lab_prefilter_vec(
     pal_lch_mat: Lch,
     near_extreme_neutral: bool,
     k: int,
-) -> int:
+    *,
+    pal_is_neutral: np.ndarray,
+) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray]:
     idxs = prefilter_topk(s_lab, pal_lab_mat, k)
     cand_lab = pal_lab_mat[idxs]
     cand_lch = pal_lch_mat[idxs]
-    dE = ciede2000_vec(s_lab, cand_lab)
-    comp_base, tC = photo_cost_components(s_lab, s_lch, L_local, w_local_eff, cand_lch)
-    cost = dE + comp_base
+    dE = delta_e2000_vec(s_lab, cand_lab)
+    comp, tC = photo_cost_components(s_lab, s_lch, L_local, w_local_eff, cand_lch)
+    cost = dE + comp
+
+    # gentle neutral preference near neutral sources
+    if s_lch[1] <= NEUTRAL_EST_C:
+        cost += W_NEUTRAL_GUARD * np.where(cand_lch[:, 1] <= NEUTRAL_C_MAX, 1.0, 0.0)
+        cost += W_LIGHTNESS_LOCK * np.abs(
+            (cand_lch[:, 0] - L_local) - (s_lch[0] - L_local)
+        )
+
     if near_extreme_neutral:
-        cost = np.where(tC > NEUTRAL_C_MAX, cost + 1e6, cost)
-    return int(idxs[int(np.argmin(cost))])
+        cost = np.where(cand_lch[:, 1] > NEUTRAL_C_MAX, cost + 1e6, cost)
+
+    j_rel = int(np.argmin(cost))
+    return int(idxs[j_rel]), idxs, cost, dE
 
 
-# ----------------------- helpers for progress / ETA ---------------------------
+# ----------------------- progress helpers -------------------------------------
 
 
 def _fmt_eta(seconds: float | None) -> str:
@@ -268,7 +251,6 @@ def _fmt_eta(seconds: float | None) -> str:
 
 
 def _progress(msg: str, final: bool = False) -> None:
-    # \r = return to line start, \033[K = clear to end of line
     sys.stdout.write("\r\033[K" + msg)
     sys.stdout.flush()
     if final:
@@ -276,81 +258,74 @@ def _progress(msg: str, final: bool = False) -> None:
         sys.stdout.flush()
 
 
-# ----------------------- public entry (threaded precompute) -------------------
+# ----------------------- public entry -----------------------------------------
 
 
 def dither_photo(
     img_rgb: U8Image,
     alpha: U8Mask,
-    palette: List[PaletteItem],  # items with .rgb
+    palette: List[PaletteItem],
     pal_lab_mat: Lab,
     pal_lch_mat: Lch,
-    *,
     workers: int = 1,
     **kwargs,
 ) -> U8Image:
     """
-    Serpentine error-diffusion in Lab L with palette-aware scoring.
-    Uses more colours where it lowers perceptual error.
-
-    Threading: precomputations (RGB→Lab) are parallelized across row-chunks.
-    The diffusion loop itself remains serial (Floyd–Steinberg dependency).
-
-    Progress: prints single-line % + ETA (always on; disable with progress=False).
+    Serpentine error-diffusion in Lab-L with palette-aware scoring.
+    Adds optional 2-colour micro-mix (Bayer 8×8) for closer average colour.
+    Progress: single-line % + ETA (disable with progress=False).
     """
-    # ---- progress helper (single-line overwrite + ETA) -----------------------
-    import sys, time
-
     progress_enabled = bool(kwargs.get("progress", True))
 
-    def _progress(pct: float, eta_s: float, final: bool = False) -> None:
+    def _p(pct: float, eta_s: float, final: bool = False) -> None:
         if not progress_enabled:
             return
-        mm = int(eta_s // 60)
-        ss = int(eta_s % 60)
-        msg = f"[photo] {int(pct):3d}% (ETA {mm:02d}:{ss:02d})"
+        msg = f"[photo] {int(pct):3d}% (ETA {_fmt_eta(eta_s)})"
         sys.stdout.write("\r\033[K" + msg)
         sys.stdout.flush()
         if final:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
-    # ---- image setup ---------------------------------------------------------
     H, W, _ = img_rgb.shape
     out = np.zeros_like(img_rgb, dtype=np.uint8)
 
-    # Auto-tune prefilter size (middle ground speed/quality)
-    # ~<0.8MP → 12, 0.8–2.5MP → 10, >2.5MP → 8
+    # adaptive top-k by image size
     pixels = H * W
     if pixels <= 800_000:
-        topk_eff = int(kwargs.get("topk", PHOTO_TOPK))  # default 12
+        topk_global = int(kwargs.get("topk", PHOTO_TOPK))
     elif pixels <= 2_500_000:
-        topk_eff = min(int(kwargs.get("topk", PHOTO_TOPK)), 10)
+        topk_global = min(int(kwargs.get("topk", PHOTO_TOPK)), 10)
     else:
-        topk_eff = min(int(kwargs.get("topk", PHOTO_TOPK)), 8)
+        topk_global = min(int(kwargs.get("topk", PHOTO_TOPK)), 8)
 
-    # Threaded RGB→Lab (row chunks)
-    t0 = time.perf_counter()
+    # RGB→Lab (threaded)
     lab_img = _rgb_to_lab_threaded(img_rgb, workers).reshape(H, W, 3)
     L_src = lab_img[..., 0].astype(np.float32, copy=False)
 
-    # Vector precompute
+    # precompute locals
     L_loc = box_blur_2d(L_src, BLUR_RADIUS)
     G = grad_mag(L_src)
     a_bias, b_bias = estimate_ab_bias(lab_img, alpha)
-
     errL = np.zeros((H, W), dtype=np.float32)
 
-    # Progress timing
-    start = time.perf_counter()
-    last_tick = start
-    rows_done = 0
+    pal_is_neutral = pal_lch_mat[:, 1] <= NEUTRAL_C_MAX
 
-    # Update frequency: every ~1% or 0.25s, whichever is later
+    # tiny decision cache
+    pick_cache: Dict[Tuple[int, int, int, int, int, int], int] = {}
+
+    # --- ETA: EWMA of row time (stable) --------------------------------------
+    start = time.perf_counter()
+    last_row_t = start
+    rows_done = 0
+    ewma_row_ms = None
+    EWMA_ALPHA = 0.15  # inertia (lower = smoother)
+
     pct_step_rows = max(1, H // 100)
     min_interval = 0.25
+    last_progress = start
 
-    # ---- main diffusion ------------------------------------------------------
+    # main diffusion
     for y in range(H):
         serp_left = (y % 2) == 0
         xs = range(W) if serp_left else range(W - 1, -1, -1)
@@ -364,65 +339,117 @@ def dither_photo(
             if alpha[y, x] == 0:
                 continue
 
-            # Local-contrast weight from gradient
+            # gradient -> local weight
             wloc = max(0.2, 1.0 - (G[y, x] / GRAD_K))
 
-            # Source Lab with error + neutral bias compensation
+            # source Lab with error & neutral bias
             sL = float(lab_img[y, x, 0]) + float(errL[y, x])
             sa = float(lab_img[y, x, 1]) - a_bias
             sb = float(lab_img[y, x, 2]) - b_bias
-            s_lab_adj = np.array([sL, sa, sb], dtype=np.float32)
-
-            # To LCh (fast, local)
             C = float(math.hypot(sa, sb))
             h = (math.degrees(math.atan2(sb, sa)) + 360.0) % 360.0
-            s_lch_adj = np.array([sL, C, h], dtype=np.float32)
 
-            # Extreme near-neutral pixels near black/white: restrict to neutrals
             near_extreme = (C <= NEAR_NEUTRAL_C) and (
                 sL <= NEAR_BLACK_L or sL >= NEAR_WHITE_L
             )
 
-            # Prefilter by Lab Euclidean (top-k), then score with dE2000 + photo costs
-            idxs = prefilter_topk(s_lab_adj, pal_lab_mat, topk_eff)
-            cand_lab = pal_lab_mat[idxs]
-            cand_lch = pal_lch_mat[idxs]
-            dE = ciede2000_vec(s_lab_adj, cand_lab)
-            comp, tC = photo_cost_components(
-                s_lab_adj, s_lch_adj, float(L_loc[y, x]), W_LOCAL_BASE * wloc, cand_lch
-            )
-            cost = dE + comp
-            if near_extreme:
-                cost = np.where(tC > NEUTRAL_C_MAX, cost + 1e6, cost)
-            j = int(idxs[int(np.argmin(cost))])
+            # adaptive top-k: open up a bit for high-chroma
+            topk_eff = topk_global + (4 if C >= 24.0 else 0)
 
-            # Write RGB
-            r, g, b = palette[j].rgb
+            # decision cache
+            key = (
+                int(round(sL / Q_L)),
+                int(round(sa / Q_AB)),
+                int(round(sb / Q_AB)),
+                int(round(L_loc[y, x] / Q_LLOC)),
+                int(round(wloc / Q_WLOC)),
+                1 if near_extreme else 0,
+            )
+            j_pick = pick_cache.get(key, -1)
+
+            if j_pick < 0 or MIX_ENABLE:
+                s_lab = np.array([sL, sa, sb], dtype=np.float32)
+                s_lch = np.array([sL, C, h], dtype=np.float32)
+
+                j_best, idxs, cost, dE = _nearest_idx_photo(
+                    s_lab,
+                    s_lch,
+                    float(L_loc[y, x]),
+                    W_LOCAL_BASE * wloc,
+                    pal_lab_mat,
+                    pal_lch_mat,
+                    near_extreme_neutral=near_extreme,
+                    k=topk_eff,
+                    pal_is_neutral=pal_is_neutral,
+                )
+                j_pick = j_best
+
+                # --- 2-colour micro-mix (optional) --------------------------
+                # Find an alternate partner to reduce ΔE2000 on average.
+                if MIX_ENABLE:
+                    # choose partner among top MIX_TOPK distinct candidates
+                    rel_sorted = np.argsort(cost)[: min(MIX_TOPK, cost.size)]
+                    rel_sorted = [r for r in rel_sorted if idxs[r] != j_best]
+                    if rel_sorted:
+                        j_alt_rel = rel_sorted[0]
+                        j_alt = int(idxs[j_alt_rel])
+
+                        # if near-extreme, optionally force both to neutral
+                        if (not MIX_LOCK_NEUTRALS) or (
+                            pal_lch_mat[j_best, 1] <= NEUTRAL_C_MAX
+                            and pal_lch_mat[j_alt, 1] <= NEUTRAL_C_MAX
+                        ):
+                            p0 = pal_lab_mat[j_best]
+                            p1 = pal_lab_mat[j_alt]
+                            d = p0 - p1
+                            denom = float(np.dot(d, d)) + 1e-12
+                            # fraction of p0 to best match s_lab in least squares
+                            w = float(np.dot(s_lab - p1, d) / denom)
+                            w = 0.0 if w < 0.0 else 1.0 if w > 1.0 else w
+
+                            mix_lab = (w * p0 + (1.0 - w) * p1).astype(np.float32)
+                            # evaluate ΔE of the *average*
+                            de_mix = float(delta_e2000_vec(s_lab, mix_lab[None, :])[0])
+                            de_best = float(delta_e2000_vec(s_lab, p0[None, :])[0])
+
+                            if de_mix + 1e-6 < de_best - MIX_MIN_DE_GAIN:
+                                # stochastic choice via Bayer threshold (tile)
+                                t = float(_BAYER8[y & 7, x & 7])
+                                # coverage: use p0 when t < w
+                                j_pick = j_best if t < w else j_alt
+                            # else: keep single best
+
+                pick_cache[key] = j_pick
+
+            # write RGB
+            r, g, b = palette[j_pick].rgb
             out[y, x, 0] = r
             out[y, x, 1] = g
             out[y, x, 2] = b
 
-            # Diffuse L error (clamped)
-            tgt_L = float(pal_lch_mat[j, 0])
+            # diffuse L error
+            tgt_L = float(pal_lch_mat[j_pick, 0])
             eL = max(-EL_CLAMP, min(EL_CLAMP, sL - tgt_L))
             for dx, dy, w in neigh:
                 nx, ny = x + dx, y + dy
                 if 0 <= ny < H and 0 <= nx < W and alpha[ny, nx] != 0:
                     errL[ny, nx] += eL * w
 
-        # progress update (row-level)
+        # --- ETA update (EWMA) ----------------------------------------------
         rows_done += 1
-        if (rows_done % pct_step_rows == 0) or (time.perf_counter() - last_tick >= min_interval):
-            now = time.perf_counter()
-            elapsed = now - start
-            rows_left = max(0, H - rows_done)
-            rps = rows_done / elapsed if elapsed > 0 else 0.0
-            eta = rows_left / rps if rps > 0 else 0.0
-            _progress(100.0 * rows_done / H, eta, final=False)
-            last_tick = now
+        now = time.perf_counter()
+        row_dt = now - last_row_t
+        last_row_t = now
+        if ewma_row_ms is None:
+            ewma_row_ms = row_dt
+        else:
+            ewma_row_ms = (1.0 - EWMA_ALPHA) * ewma_row_ms + EWMA_ALPHA * row_dt
 
-    # final progress line
-    total_eta = 0.0
-    _progress(100.0, total_eta, final=True)
+        if (rows_done % pct_step_rows == 0) or (now - last_progress >= min_interval):
+            rows_left = H - rows_done
+            eta = max(0.0, rows_left * float(ewma_row_ms))
+            _p(100.0 * rows_done / H, eta, final=False)
+            last_progress = now
+
+    _p(100.0, 0.0, final=True)
     return out
-

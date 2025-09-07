@@ -5,15 +5,14 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from .core_types import PaletteItem, Lab, Lch, RGBTuple
-from .color_convert import rgb_to_lab, lab_to_lch
+from .core_types import PaletteItem, Lab, Lch, RGBTuple, hex_to_rgb
+from .colour_convert import rgb_to_lab, lab_to_lch
 
 """
 Palette definitions and builders.
 
 Exports:
 - PALETTE: list[tuple[str, str]]   # [(hex, name), ...]
-- GREY_HEXES: list[str]
 - build_palette(hex_name_pairs=PALETTE)
     -> (items: list[PaletteItem],
         name_of: dict[RGBTuple, str],
@@ -88,22 +87,6 @@ PALETTE: List[Tuple[str, str]] = [
     ("#ffffff", "White"),
 ]
 
-GREY_HEXES: List[str] = [
-    "#000000",
-    "#3c3c3c",
-    "#787878",
-    "#aaaaaa",
-    "#d2d2d2",
-    "#ffffff",
-]
-
-# ---------------- Helpers ----------------
-
-
-def _hex_to_rgb(h: str) -> RGBTuple:
-    h = h.lstrip("#")
-    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
-
 
 # ---------------- Build palette / structures ----------------
 
@@ -113,18 +96,19 @@ def build_palette(
 ) -> Tuple[List[PaletteItem], Dict[RGBTuple, str], Lab, Lch]:
     """
     Convert list of (hex, name) into:
-      - list of PaletteItem (rgb, name, lab, lch)
+      - items: list[PaletteItem] (rgb, name, lab, lch)
       - name_of: dict[RGBTuple -> name]
-      - pal_lab: Lab  (P,3)
-      - pal_lch: Lch  (P,3)
+      - pal_lab: Lab  (P,3) float32
+      - pal_lch: Lch  (P,3) float32
     """
-    rgbs_u8 = np.array([_hex_to_rgb(hx) for hx, _ in hex_name_pairs], dtype=np.uint8)
+    rgbs_u8 = np.array([hex_to_rgb(hx) for hx, _ in hex_name_pairs], dtype=np.uint8)
 
-    # Convert once to Lab/LCh (float32) for all palette colours
     pal_lab: Lab = (
-        rgb_to_lab(rgbs_u8.astype(np.float32)).reshape(-1, 3).astype(np.float32)
+        rgb_to_lab(rgbs_u8.astype(np.float32))
+        .reshape(-1, 3)
+        .astype(np.float32, copy=False)
     )
-    pal_lch: Lch = lab_to_lch(pal_lab).reshape(-1, 3).astype(np.float32)
+    pal_lch: Lch = lab_to_lch(pal_lab).reshape(-1, 3).astype(np.float32, copy=False)
 
     items: List[PaletteItem] = []
     name_of: Dict[RGBTuple, str] = {}
@@ -148,4 +132,4 @@ def build_palette(
     return items, name_of, pal_lab, pal_lch
 
 
-__all__ = ["PALETTE", "GREY_HEXES", "build_palette"]
+__all__ = ["PALETTE", "build_palette"]

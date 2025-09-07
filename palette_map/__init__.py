@@ -4,37 +4,41 @@ palette_map package.
 
 Exports:
 - run_pixel: refined pixel-mode mapper
-- analysis, color_convert, core_types, enforce, palette_data modules
+- bw: black/white helpers (dither_bw, run_bw_auto, selectors)
+- colour_convert, core_types, palette_lock, palette_data, colour_metrics
 - PALETTE (if defined in palette_data)
 
 Usage:
     from palette_map import run_pixel
-    from palette_map.color_convert import lab_to_lch, rgb_to_lab
+    from palette_map.colour_convert import lab_to_lch, rgb_to_lab
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.1"
 
 # Core namespaces
-from . import color_convert as color_convert
-from . import core_types as core_types
-from . import palette_lock as palette_lock
-from . import palette_data as palette_data
+from . import colour_convert 
+from . import core_types 
+from . import palette_lock 
+from . import palette_data 
+from . import colour_select
+
 
 # Data
 try:
-    from .palette_data import PALETTE as PALETTE  # type: ignore
+    from .palette_data import PALETTE as PALETTE
 except Exception:
-    PALETTE = None  # type: ignore[assignment]
+    PALETTE = None
 
 # Pixel mode entry (no stub; fail fast if missing)
-from .pixel.run import run_pixel  # type: ignore
+from .pixel.run import run_pixel
 
 __all__ = [
     "__version__",
-    "color_convert",
+    "colour_convert",
     "core_types",
     "palette_lock",
     "palette_data",
+    "colour_select",
     "PALETTE",
     "run_pixel",
 ]
