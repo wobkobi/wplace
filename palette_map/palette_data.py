@@ -1,6 +1,18 @@
 # palette_map/palette_data.py
 from __future__ import annotations
 
+"""
+Palette definitions and builders.
+
+Exports:
+  PALETTE: list[tuple[str, str]]  # [(hex, name), ...]
+  build_palette(hex_name_pairs=PALETTE)
+    -> (items: list[PaletteItem],
+        name_of: dict[RGBTuple, str],
+        pal_lab: Lab,
+        pal_lch: Lch)
+"""
+
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -8,18 +20,6 @@ import numpy as np
 from .core_types import PaletteItem, Lab, Lch, RGBTuple, hex_to_rgb
 from .colour_convert import rgb_to_lab, lab_to_lch
 
-"""
-Palette definitions and builders.
-
-Exports:
-- PALETTE: list[tuple[str, str]]   # [(hex, name), ...]
-- build_palette(hex_name_pairs=PALETTE)
-    -> (items: list[PaletteItem],
-        name_of: dict[RGBTuple, str],
-        pal_lab: Lab, pal_lch: Lch)
-"""
-
-# ---------------- User Palette (hex, name) ----------------
 
 PALETTE: List[Tuple[str, str]] = [
     ("#ed1c24", "Red"),
@@ -88,18 +88,15 @@ PALETTE: List[Tuple[str, str]] = [
 ]
 
 
-# ---------------- Build palette / structures ----------------
-
-
 def build_palette(
     hex_name_pairs: List[Tuple[str, str]] = PALETTE,
 ) -> Tuple[List[PaletteItem], Dict[RGBTuple, str], Lab, Lch]:
     """
-    Convert list of (hex, name) into:
-      - items: list[PaletteItem] (rgb, name, lab, lch)
-      - name_of: dict[RGBTuple -> name]
-      - pal_lab: Lab  (P,3) float32
-      - pal_lch: Lch  (P,3) float32
+    Convert a list of (hex, name) into:
+      items: list[PaletteItem] with rgb, name, lab, lch
+      name_of: dict mapping RGBTuple -> name
+      pal_lab: float32 array [P,3]
+      pal_lch: float32 array [P,3]
     """
     rgbs_u8 = np.array([hex_to_rgb(hx) for hx, _ in hex_name_pairs], dtype=np.uint8)
 

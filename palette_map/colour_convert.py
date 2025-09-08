@@ -1,7 +1,24 @@
 # palette_map/colour_convert.py
 from __future__ import annotations
 
+"""
+Colour conversions and metrics (D65).
+
+Exports:
+  rgb_to_linear(u)
+  rgb_to_lab(rgb)
+  lab_to_lch(lab)
+  delta_e2000_pair(lab1, lab2)
+  delta_e2000_vec(src_lab, cand_lab)
+  rgb_to_lab_threaded(rgb, workers)
+
+Compat aliases:
+  ciede2000_pair === delta_e2000_pair
+  ciede2000_vec  === delta_e2000_vec
+"""
+
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import Sequence
 
 import numpy as np
@@ -9,29 +26,15 @@ from numpy.typing import NDArray
 
 from .core_types import Lab, Lch  # NDArray[np.float32]
 
-"""
-Colour conversions and metrics (D65).
 
-Exports:
-- rgb_to_linear(u)
-- rgb_to_lab(rgb)
-- lab_to_lch(lab)
-- delta_e2000_pair(lab1, lab2)
-- delta_e2000_vec(src_lab, cand_lab)
-
-Compat aliases:
-- ciede2000_pair === delta_e2000_pair
-- ciede2000_vec  === delta_e2000_vec
-"""
-
-
-# ---------------- sRGB → linear ----------------------------------------------
-
-
+# sRGB to linear
 def rgb_to_linear(u: np.ndarray) -> np.ndarray:
     """
-    sRGB (nonlinear 0..1) → linear RGB (0..1). Vectorized. Returns float32.
-    Accepts any shape (..., 3).
+    sRGB (nonlinear 0..1) to linear RGB (0..1). Vectorized.
+    Args:
+      u: array[...,3] in 0..1 (float)
+    Returns:
+      float32 array[...,3]
     """
     u = u.astype(np.float32, copy=False)
     with np.errstate(invalid="ignore"):
@@ -39,29 +42,24 @@ def rgb_to_linear(u: np.ndarray) -> np.ndarray:
     return out.astype(np.float32, copy=False)
 
 
-# ---------------- sRGB → Lab (D65) -------------------------------------------
-
-
+# sRGB to Lab (D65)
 def rgb_to_lab(rgb: np.ndarray) -> Lab:
     """
-    sRGB → CIE Lab (D65). Accepts uint8 [0..255] or float32/float64 [0..1].
-    Preserves input shape (..., 3). Returns float32.
+    sRGB to CIE Lab (D65).
+    Accepts uint8 [0..255] or float [0..1]. Preserves shape (...,3). Returns float32.
     """
     arr = rgb.astype(np.float32, copy=False)
     if arr.max() > 1.0:
         arr = arr / 255.0
 
-    # sRGB → linear
     rl = rgb_to_linear(arr[..., 0])
     gl = rgb_to_linear(arr[..., 1])
     bl = rgb_to_linear(arr[..., 2])
 
-    # linear RGB → XYZ (D65)
     X = 0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl
     Y = 0.2126729 * rl + 0.7151522 * gl + 0.0721750 * bl
     Z = 0.0193339 * rl + 0.1191920 * gl + 0.9503041 * bl
 
-    # XYZ → Lab (D65 white)
     Xn, Yn, Zn = 0.95047, 1.00000, 1.08883
     x, y, z = X / Xn, Y / Yn, Z / Zn
     e, k = 216.0 / 24389.0, 24389.0 / 27.0
@@ -84,14 +82,11 @@ def rgb_to_lab(rgb: np.ndarray) -> Lab:
     return out
 
 
-# ---------------- Lab → LCh ---------------------------------------------------
-
-
+# Lab to LCh
 def lab_to_lch(lab: Lab) -> Lch:
     """
-    Lab(float32)[...,3] → LCh(float32)[...,3].
-    L*=L, C*=sqrt(a^2+b^2), h°=atan2(b,a) in degrees [0,360).
-    Shape is preserved.
+    Lab[...,3] to LCh[...,3] (degrees in [0,360)).
+    Returns float32 with shape preserved.
     """
     orig = lab.shape
     flat = lab.reshape(-1, 3).astype(np.float32, copy=False)
@@ -104,16 +99,14 @@ def lab_to_lch(lab: Lab) -> Lch:
     return lch.reshape(orig)
 
 
-# ---------------- CIEDE2000 (shared) -----------------------------------------
-
-
+# CIEDE2000
 def delta_e2000_pair(
     lab1: Sequence[float] | NDArray[np.floating],
     lab2: Sequence[float] | NDArray[np.floating],
 ) -> float:
     """
     CIEDE2000 distance between two Lab colours.
-    Scalar implementation (reference-consistent).
+    Scalar reference implementation.
     """
     L1, a1, b1 = float(lab1[0]), float(lab1[1]), float(lab1[2])
     L2, a2, b2 = float(lab2[0]), float(lab2[1]), float(lab2[2])
@@ -195,9 +188,13 @@ def delta_e2000_pair(
 
 def delta_e2000_vec(s: Lab, cand: Lab) -> NDArray[np.float32]:
     """
-    Row-wise ΔE for one source Lab vs many candidate Labs.
-    Uses the exact scalar routine per row to keep results identical
-    across modules (good for small k in top-k searches).
+    Row-wise dE for one source Lab vs many candidate Labs.
+    Uses the scalar routine per row for consistent results.
+    Args:
+      s: Lab [3] or [1,3]
+      cand: Lab [N,3]
+    Returns:
+      float32 array [N]
     """
     s = np.asarray(s, dtype=np.float32)
     cand = np.asarray(cand, dtype=np.float32)
@@ -207,8 +204,35 @@ def delta_e2000_vec(s: Lab, cand: Lab) -> NDArray[np.float32]:
     return out
 
 
-# ---- Compat aliases ----------------------------------------------------------
+def _split_rows(h: int, parts: int) -> list[tuple[int, int]]:
+    """
+    Partition height h into about parts contiguous [start, end) row spans.
+    """
+    parts = max(1, int(parts))
+    step = (h + parts - 1) // parts
+    return [(i, min(i + step, h)) for i in range(0, h, step)]
 
+
+def rgb_to_lab_threaded(rgb: np.ndarray, workers: int) -> Lab:
+    """
+    Threaded RGB to Lab conversion by splitting rows.
+    Args:
+      rgb: uint8 or float array [H,W,3]
+      workers: number of threads; if <=1 or H<256, runs single-threaded
+    Returns:
+      Lab float32 array [H,W,3]
+    """
+    H = int(rgb.shape[0])
+    if workers <= 1 or H < 256:
+        return rgb_to_lab(rgb).astype(np.float32, copy=False)
+    chunks = _split_rows(H, workers)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(rgb_to_lab, rgb[s:e]) for s, e in chunks]
+        parts = [f.result().astype(np.float32, copy=False) for f in futs]
+    return np.vstack(parts).astype(np.float32, copy=False)
+
+
+# Compat aliases
 ciede2000_pair = delta_e2000_pair
 ciede2000_vec = delta_e2000_vec
 
@@ -219,6 +243,7 @@ __all__ = [
     "lab_to_lch",
     "delta_e2000_pair",
     "delta_e2000_vec",
+    "rgb_to_lab_threaded",
     "ciede2000_pair",
     "ciede2000_vec",
 ]
