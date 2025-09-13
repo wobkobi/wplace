@@ -42,6 +42,15 @@ def fmt_eta(seconds: float | None) -> str:
         return f"{m}m {r}s"
     return f"{s}s"
 
+def _fmt_total_compact(s: float) -> str:
+    # minutes + seconds if >=60s; seconds with decimals if <60s; ms if <1s
+    if s >= 60.0:
+        m = int(s // 60)
+        r = int(round(s - 60 * m))
+        return f"{m}m {r}s"
+    if s >= 1.0:
+        return f"{s:.1f}s"
+    return f"{s * 1000.0:.1f}ms"
 
 def weighted_percentile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
     """Weighted percentile for q in [0,1]."""

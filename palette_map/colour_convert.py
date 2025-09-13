@@ -30,7 +30,7 @@ from .core_types import Lab, Lch  # NDArray[np.float32]
 # sRGB to linear
 def rgb_to_linear(u: np.ndarray) -> np.ndarray:
     """
-    sRGB (nonlinear 0..1) to linear RGB (0..1). Vectorized.
+    sRGB (nonlinear 0..1) to linear RGB (0..1). Vectorised.
     Args:
       u: array[...,3] in 0..1 (float)
     Returns:

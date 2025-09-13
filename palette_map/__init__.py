@@ -6,8 +6,8 @@ Purpose:
   Utilities for remapping images to the wplace palette. See palette_map.py for CLI.
 
 Public API:
-  run_pixel: pixel-art recoloring entry point.
-  colour_convert: color space transforms (rgb_to_lab, lab_to_lch, etc.).
+  run_pixel: pixel-art recolouring entry point.
+  colour_convert: colour space transforms (rgb_to_lab, lab_to_lch, etc.).
   core_types: shared type aliases (U8Image, U8Mask, Lab, Lch, NameOf, PaletteItem).
   palette_lock: palette tier and gating helpers.
   palette_data: palette definitions and build_palette().

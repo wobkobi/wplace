@@ -283,7 +283,7 @@ def run_pixel(
       3) ensemble selection
       4) unique grey assignment to neutrals
       5) light decongestion
-      6) materialize per-pixel
+      6) materialise per-pixel
     """
     uniq_rgb, counts, inv = _unique_visible_with_inverse(img_rgb, alpha)
     if uniq_rgb.shape[0] == 0:

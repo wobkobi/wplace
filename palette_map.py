@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 palette_map.py
-Recolor RGBA images to the wplace palette. Supports "pixel" and "photo" strategies.
+Recolour RGBA images to the wplace palette. Supports "pixel" and "photo" strategies.
 
 Usage:
   python palette_map.py INPUT [OUTPUT] --mode [auto|pixel|photo] --height H --resample [nearest|bilinear|bicubic|lanczos] --debug
@@ -12,13 +12,13 @@ Modes:
   auto  : Choose pixel for small images and photo otherwise.
 
 Input:
-  Any Pillow-readable image. Alpha is preserved. Only nonzero alpha pixels are recolored.
+  Any Pillow-readable image. Alpha is preserved. Only nonzero alpha pixels are recoloured.
 
 Output:
   PNG by default. If OUTPUT is omitted, writes <stem>_wplace.png next to INPUT.
 
 Notes:
-  Palette data and color transforms come from palette_map.palette_data and colour_* modules.
+  Palette data and colour transforms come from palette_map.palette_data and colour_* modules.
   Shared IO/math helpers come from palette_map.utils.
   CPU bound. ThreadPoolExecutor is used where safe.
 """
@@ -52,6 +52,7 @@ from palette_map.core_types import PaletteItem, U8Image, U8Mask, Lab, Lch, NameO
 from palette_map.colour_convert import rgb_to_lab, lab_to_lch
 from palette_map.colour_select import restrict_palette
 from palette_map.utils import (
+    _fmt_total_compact,
     fmt_secs,
     fmt_eta,
     load_rgba,
@@ -82,7 +83,7 @@ def _enable_line_buffered_stdout() -> None:
 
 def parse_args() -> argparse.Namespace:
     """
-    Parse CLI arguments for palette recoloring.
+    Parse CLI arguments for palette recolouring.
 
     Returns:
       argparse.Namespace with:
@@ -129,7 +130,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Restrict to top-K palette colours. Omit value for auto K; omit flag for full palette.",
     )
-    p.add_argument("--jobs", type=int, default=1, help="Files processed in parallel")
+    p.add_argument("--jobs", type=int, default=2, help="Files processed in parallel")
     p.add_argument(
         "--workers", type=int, default=os.cpu_count() or 4, help="Internal workers"
     )
@@ -262,12 +263,23 @@ def _process_one(
     rgb_in, alpha = load_rgba(src_path)
     h0, w0 = rgb_in.shape[0], rgb_in.shape[1]
 
+    # Debug: report original size and alpha
+    if debug:
+        a_full0 = int(np.count_nonzero(alpha == 255))
+        a_zero0 = int(np.count_nonzero(alpha == 0))
+        print(
+            f"[debug] load   {w0}x{h0}  alpha(255)={a_full0}  alpha(0)={a_zero0}",
+            flush=True,
+        )
+
+    # Mode selection
     eff_mode = mode
     if mode == "auto":
         eff_mode = decide_auto_mode(rgb_in, alpha, pal_lab)
         if debug:
             print(f"[debug] auto picked mode = {eff_mode}", flush=True)
 
+    # Optional resize
     t_r0 = time.perf_counter()
     if height is not None and h0 > height:
         new_h = height
@@ -285,22 +297,21 @@ def _process_one(
             Image.fromarray(alpha).resize((new_w, new_h), res), dtype=np.uint8
         )
 
+    # Debug: report effective size and alpha after resize, and mode
     t_r1 = time.perf_counter()
     h, w = rgb_in.shape[0], rgb_in.shape[1]
 
     if debug:
-        a_full0 = int(np.count_nonzero(alpha == 255))
-        a_zero0 = int(np.count_nonzero(alpha == 0))
-        print(
-            f"[debug] load   {w0}x{h0}  alpha(255)={a_full0}  alpha(0)={a_zero0}",
-            flush=True,
-        )
-        print(
-            f"[debug] size   {w}x{h}  alpha(255)={a_full0}  alpha(0)={a_zero0}",
-            flush=True,
-        )
+        a_full1 = int(np.count_nonzero(alpha == 255))
+        a_zero1 = int(np.count_nonzero(alpha == 0))
+        if (w, h) != (w0, h0):
+            print(
+                f"[debug] size   {w}x{h}  alpha(255)={a_full1}  alpha(0)={a_zero1}",
+                flush=True,
+            )
         print(f"[debug] mode   {eff_mode}", flush=True)
 
+    # Palette restriction
     if limit_arg is None:
         colours_mode = "full"
         limit_opt = None
@@ -319,16 +330,16 @@ def _process_one(
         limit_opt=limit_opt,
         debug=debug,
     )
-
     t1 = time.perf_counter()
 
+    # Pre-map debug
     uniq_rgb, counts = unique_visible(rgb_in, alpha)
     if debug:
-        print(
-            f"[debug] pixel size_in={w0}x{h0}  size_eff={w}x{h}  workers={workers}  time={fmt_secs(t1 - t_r1)}",
-            flush=True,
-        )
         if eff_mode == "pixel":
+            print(
+                f"[debug] pre-map size={w}x{h}  workers={workers}  prep_time={fmt_secs(t1 - t_r1)}",
+                flush=True,
+            )
             top16 = counts[np.argsort(-counts)[:16]].sum() if len(counts) else 0
             total = counts.sum() if len(counts) else 1
             share = (top16 / total) if total else 0.0
@@ -338,9 +349,10 @@ def _process_one(
             )
         else:
             _print_debug_photo(
-                uniq_rgb, counts, pal_rgb_sel, pal_lab_sel, name_of_hex, top_k=20
+                uniq_rgb, counts, pal_rgb_sel, pal_lab_sel, name_of_hex, top_k=10
             )
 
+    # Map
     try:
         if eff_mode == "photo":
             items_sel = [items[i] for i in sel_idx.tolist()]
@@ -351,7 +363,8 @@ def _process_one(
                 pal_lab_sel,
                 pal_lch_sel,
                 workers=workers,
-                progress=debug,
+                progress=True,  # always show ETA in photo mode
+                profile=debug,  # detailed per-stage timing when --debug
             )
         else:
             mapped = run_pixel(
@@ -377,12 +390,13 @@ def _process_one(
         if debug:
             print(f"[debug] mapper failed ({e}); falling back to nearest", flush=True)
         mapped = map_nearest_rgb_lab(rgb_in, alpha, pal_rgb_sel, pal_lab_sel)
-
     t2 = time.perf_counter()
 
+    # Save
     save_png_rgba(out_path, mapped, alpha)
     t3 = time.perf_counter()
 
+    # Report
     print(f"Mode: {eff_mode}", flush=True)
     print(
         f"Wrote {out_path.name} | size={w}x{h} | palette_size={pal_rgb_sel.shape[0]}",
@@ -391,12 +405,29 @@ def _process_one(
     print("Colours used:", flush=True)
     for hhex, nm, cnt in colour_usage_report(mapped, alpha, name_of_hex):
         print(f"  {hhex}  {nm}: {cnt}", flush=True)
-    print(
-        f"[debug] total  {fmt_secs(t3 - t0)}  "
-        f"(load={fmt_secs(t1 - t0)}, resize={fmt_secs(t_r1 - t_r0)}, "
-        f"mode={fmt_secs(t2 - t1)}, save={fmt_secs(t3 - t2)})",
-        flush=True,
-    )
+
+    total_pixels = int((alpha > 0).sum())
+    print(f"Total pixels: {total_pixels}", flush=True)
+
+    if debug:
+        map_s = t2 - t1
+        if map_s > 0:
+            rate_mpx_s = (total_pixels / map_s) / 1e6
+            mpx = total_pixels / 1e6
+            print(
+                f"[debug] throughput {rate_mpx_s:.2f} MPx/s  ({mpx:.2f} MPx in {fmt_secs(map_s)})",
+                flush=True,
+            )
+
+    if debug:
+        print(
+            f"[debug] total {_fmt_total_compact(t3 - t0)}  "
+            f"(load={fmt_secs(t1 - t0)}, resize={fmt_secs(t_r1 - t_r0)}, "
+            f"mode={fmt_secs(t2 - t1)}, save={fmt_secs(t3 - t2)})",
+            flush=True,
+        )
+    else:
+        print(f"total  {_fmt_total_compact(t3 - t0)}", flush=True)
 
 
 def _process_one_captured(
