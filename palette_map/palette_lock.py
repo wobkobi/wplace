@@ -22,7 +22,7 @@ import numpy as np
 
 from .colour_convert import rgb_to_lab
 from .core_types import RGBTuple, PaletteItem, U8Image, U8Mask, Lab
-from .utils import nearest_palette_indices_lab
+from .utils import nearest_palette_indices_lab_distance
 
 
 def palette_set(palette: List[PaletteItem]) -> Set[RGBTuple]:
@@ -92,7 +92,7 @@ def lock_to_palette_by_uniques(
 
     # Map each offending unique RGB to its nearest palette RGB
     pal_rgb_arr = np.array([p.rgb for p in palette], dtype=np.uint8)
-    nearest = nearest_palette_indices_lab(off_lab, pal_lab_mat)  # [M]
+    nearest = nearest_palette_indices_lab_distance(off_lab, pal_lab_mat)  # [M]
     mapping: Dict[RGBTuple, RGBTuple] = {}
     for i in range(off_np.shape[0]):
         key_rgb: RGBTuple = (int(off_np[i, 0]), int(off_np[i, 1]), int(off_np[i, 2]))

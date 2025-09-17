@@ -1,8 +1,8 @@
 # wplace palette mapper
 
-I could not find a color remapper I liked, so I wrote one. It has two modes. One for pixel art. One for photos and painterly stuff. They use different logic. Play with both.
+I could not find a colour remapper I liked, so I wrote one. It has two modes. One for pixel art. One for photos and painterly stuff. They use different logic. Play with both.
 
-You can cap how many different colors the output uses, like with black and white images only using black and white. You can also scale the image. Pixel and photo modes prefer different resamplers. You can change which one is used if you want to get technical.
+You can cap how many different colours the output uses, like with black and white images only using black and white. You can also scale the image. Pixel and photo modes prefer different resamplers. You can change which one is used if you want to get technical.
 
 ## Install
 
@@ -30,13 +30,13 @@ Output is `<name>_wplace.png` unless you set `--outdir`.
 
 ### pixel
 
-Fast global matching in OKLab and OKLCh with a few guards for lightness and neutrals. Good for sprites, icons, UI, and flat colors.
+Fast global matching in OKLab and OKLCh with a few guards for lightness and neutrals. Good for sprites, icons, UI, and flat colours.
 
 ### photo
 
-Dithered remap with error diffusion in Lab-L. Has a tiny 2 color micro mix that helps gradients and skin. Good for photos, soft shading, and noisy sources.
+Dithered remap with error diffusion in Lab-L. Has a tiny 2 colour micro mix that helps gradients and skin. Good for photos, soft shading, and noisy sources.
 
-## Limit how many colors are used
+## Limit how many colours are used
 
 This caps the palette for the current image. Use this when you want a tighter look.
 
@@ -44,11 +44,11 @@ This caps the palette for the current image. Use this when you want a tighter lo
 # pick a good K automatically from the image
 python palette_map.py input.png --limit
 
-# hard cap to K colors
+# hard cap to K colours
 python palette_map.py input.png --limit 8
 ```
 
-Tip: `--limit` works in both modes. The code picks the top colors the image actually uses, not just the first K in the palette.
+Tip: `--limit` works in both modes. The code picks the top colours the image actually uses, not just the first K in the palette.
 
 ## Scaling
 
@@ -72,9 +72,9 @@ python palette_map.py input.png --resample bicubic
 python palette_map.py input.png --resample lanczos
 ```
 
-## Debug and color report
+## Debug and colour report
 
-Use `--debug` to see what the mapper is doing and a per color usage summary.
+Use `--debug` to see what the mapper is doing and a per colour usage summary.
 
 ```bash
 python palette_map.py input.png --debug
@@ -109,7 +109,7 @@ python palette_map.py images/ --jobs 4 --workers 8
 
 ## Notes
 
-- Alpha is preserved. Only pixels with alpha > 0 are recolored.
+- Alpha is preserved. Only pixels with alpha > 0 are recoloured.
 - Output is PNG.
 - The mapper will fall back to a simple nearest match if something fails.
 - Photo does take a while for bigger photos but it is worth it.
@@ -141,13 +141,13 @@ All flags are optional unless noted.
 - `--limit [K]` Limit the working palette for this image.
 
   - Use `--limit` with no number to auto-pick a good K from the image.
-  - Use `--limit K` to hard-cap to K colors (minimum 2). Works in both modes.
+  - Use `--limit K` to hard-cap to K colours (minimum 2). Works in both modes.
 
 - `--jobs N` Number of input files to process in parallel. Default `2`.
 
 - `--workers N` Internal worker threads for heavy steps. Default is your CPU count.
 
-- `--debug` Print detailed mapping stats and a per-color usage report.
+- `--debug` Print detailed mapping stats and a per-colour usage report.
 
 Examples:
 

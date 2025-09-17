@@ -1,60 +1,72 @@
-# palette_map/colour_select.py
 from __future__ import annotations
 
 """
 Palette selection helpers.
 
 Exports:
-  resolve_limit_once(colours, limit_opt) -> Optional[int]
+  resolve_limit_once(colours_mode, limit_opt) -> Optional[int]
   neutral_indices(pal_lch) -> np.ndarray
   greyish_sources(src_rgb, src_lch) -> np.ndarray
-  restrict_palette(colours, img_rgb, alpha, pal_rgb_full, pal_lab_full, pal_lch_full, name_of, limit_opt, debug=False)
+  restrict_palette(colours_mode, img_rgb, alpha, pal_rgb_full, pal_lab_full, pal_lch_full, name_of, limit_opt, debug=False)
     -> (pal_rgb, pal_lab, pal_lch, sel_idx)
 """
 
-from typing import Dict, List, Tuple, Optional
+from typing import Optional, Tuple
+
 import numpy as np
 
-from .core_types import U8Image, U8Mask, Lab, Lch, NameOf
+from .core_types import Lab, Lch, NameOf, U8Image, U8Mask
 from .colour_convert import rgb_to_lab
-from .utils import unique_visible, nearest_palette_indices_lab
+from .utils import (
+    unique_visible_rgb,
+    nearest_palette_indices_lab_distance,
+    debug_log,
+    key_value_pairs_to_string,
+)
 
+# Heuristics / knobs
 NEUTRAL_C_MAX = 5.0
 DROP_RATIO = 0.55
 COVERAGE_TARGET = 0.96
 MIN_K = 2
 
 
-def resolve_limit_once(colours: str, limit_opt: Optional[int]) -> Optional[int]:
+def resolve_limit_once(colours_mode: str, limit_opt: Optional[int]) -> Optional[int]:
     """
-    Return the user-provided limit (if >=2) or None.
+    Return the user-provided limit (if >= MIN_K) or None.
     No interactive prompting here; caller decides.
     """
-    if colours != "limited":
+    if colours_mode != "limited":
         return None
     if limit_opt is None:
         return None
-    return int(limit_opt) if limit_opt >= MIN_K else MIN_K
+    return int(limit_opt) if int(limit_opt) >= MIN_K else MIN_K
 
 
 def neutral_indices(pal_lch: Lch) -> np.ndarray:
     """
     Build a neutral pool from a palette LCh array.
-    Prefer chroma <= 10. If none, use the lowest-chroma quartile.
-    Always include darkest and brightest entries to span lightness.
+
+    Preference:
+      - primary: chroma <= 10
+      - fallback: lowest-chroma quartile
+      - always include darkest and brightest to span lightness
     """
-    C = pal_lch[:, 1].astype(np.float32, copy=False)
-    idx = np.where(C <= 10.0)[0]
+    chroma = pal_lch[:, 1].astype(np.float32, copy=False)
+    idx = np.where(chroma <= 10.0)[0]
     if idx.size == 0:
-        q = float(np.quantile(C, 0.25))
-        idx = np.where(C <= q)[0]
-    if idx.size == 0:
-        lo = int(np.argmin(pal_lch[:, 0]))
-        hi = int(np.argmax(pal_lch[:, 0]))
-        return np.unique(np.array([lo, hi], dtype=int))
+        q = float(np.quantile(chroma, 0.25))
+        idx = np.where(chroma <= q)[0]
+
     lo = int(np.argmin(pal_lch[:, 0]))
     hi = int(np.argmax(pal_lch[:, 0]))
-    return np.unique(np.concatenate([idx, np.array([lo, hi], dtype=int)])).astype(int)
+
+    if idx.size == 0:
+        return np.unique(np.array([lo, hi], dtype=np.int32))
+
+    return np.unique(np.concatenate([idx, np.array([lo, hi], dtype=np.int32)])).astype(
+        np.int32, copy=False
+    )
 
 
 def greyish_sources(src_rgb: U8Image, src_lch: Lch) -> np.ndarray:
@@ -62,22 +74,25 @@ def greyish_sources(src_rgb: U8Image, src_lch: Lch) -> np.ndarray:
     Detect grey-ish source colours among unique RGB rows.
 
     Rules:
-      small RGB channel spread (<= 20)
-      chroma <= 22
-      hue near 0 or 180 unless chroma <= 12
+      - small RGB channel spread (<= 20)
+      - chroma <= 22
+      - hue near 0 or 180 unless chroma <= 12
     Returns:
       boolean mask array with length U (unique count)
     """
-    r = src_rgb[:, 0].astype(np.int16)
-    g = src_rgb[:, 1].astype(np.int16)
-    b = src_rgb[:, 2].astype(np.int16)
-    max_delta = np.maximum(np.maximum(np.abs(r - g), np.abs(g - b)), np.abs(r - b))
-    C = src_lch[:, 1]
-    H = src_lch[:, 2]
-    d0 = np.minimum(H, 360.0 - H)
-    d180 = np.minimum(np.abs(H - 180.0), 360.0 - np.abs(H - 180.0))
-    near_neutral_axis = (np.minimum(d0, d180) <= 18.0) | (C <= 12.0)
-    return (max_delta <= 20) & (C <= 22.0) & near_neutral_axis
+    r = src_rgb[:, 0].astype(np.int16, copy=False)
+    g = src_rgb[:, 1].astype(np.int16, copy=False)
+    b = src_rgb[:, 2].astype(np.int16, copy=False)
+    max_delta = np.maximum.reduce([np.abs(r - g), np.abs(g - b), np.abs(r - b)])
+
+    chroma = src_lch[:, 1].astype(np.float32, copy=False)
+    hue = src_lch[:, 2].astype(np.float32, copy=False)
+
+    d0 = np.minimum(hue, 360.0 - hue)
+    d180 = np.minimum(np.abs(hue - 180.0), 360.0 - np.abs(hue - 180.0))
+    near_neutral_axis = (np.minimum(d0, d180) <= 18.0) | (chroma <= 12.0)
+
+    return (max_delta <= 20) & (chroma <= 22.0) & near_neutral_axis
 
 
 def _auto_k_from_hist(counts_per_palette: np.ndarray) -> int:
@@ -90,19 +105,21 @@ def _auto_k_from_hist(counts_per_palette: np.ndarray) -> int:
         return MIN_K
 
     c_sorted = np.sort(counts_per_palette)[::-1]
-    for i in range(len(c_sorted) - 1):
+    # big drop rule
+    for i in range(c_sorted.size - 1):
         a, b = float(c_sorted[i]), float(c_sorted[i + 1])
-        if a <= 0:
+        if a <= 0.0:
             break
-        if b / a <= DROP_RATIO and (i + 1) >= MIN_K:
+        if (b / a) <= DROP_RATIO and (i + 1) >= MIN_K:
             return i + 1
 
+    # coverage rule
     total = float(c_sorted.sum())
-    if total <= 0:
+    if total <= 0.0:
         return MIN_K
     cum = np.cumsum(c_sorted, dtype=np.float64)
     k_cov = int(np.searchsorted(cum, COVERAGE_TARGET * total, side="left")) + 1
-    return max(MIN_K, min(k_cov, len(c_sorted)))
+    return max(MIN_K, min(k_cov, c_sorted.size))
 
 
 def _pick_top_indices_by_usage(counts_per_palette: np.ndarray, k: int) -> np.ndarray:
@@ -110,12 +127,12 @@ def _pick_top_indices_by_usage(counts_per_palette: np.ndarray, k: int) -> np.nda
     if counts_per_palette.size == 0:
         return np.zeros((0,), dtype=np.int32)
     order = np.argsort(counts_per_palette)[::-1]
-    k = max(MIN_K, min(k, order.size))
-    return order[:k].astype(np.int32, copy=False)
+    k_eff = max(MIN_K, min(int(k), order.size))
+    return order[:k_eff].astype(np.int32, copy=False)
 
 
 def restrict_palette(
-    colours: str,
+    colours_mode: str,
     img_rgb: U8Image,
     alpha: U8Mask,
     pal_rgb_full: U8Image,
@@ -128,16 +145,17 @@ def restrict_palette(
     """
     Return a restricted palette view (pal_rgb, pal_lab, pal_lch, sel_idx).
 
-    colours:
-      "full": no restriction
-      "bw": neutrals only by LCh chroma, ensure extremes if empty
-      "limited": choose top-K by usage. If user provided --limit, treat as an
-                 upper bound and allow lowering K when a big drop is detected.
-                 If no limit provided, choose K automatically.
+    colours_mode:
+      - "full":     no restriction
+      - "bw":       neutrals only by LCh chroma; ensure extremes if empty
+      - "limited":  choose top-K by usage. If the user provided --limit, treat
+                    it as an upper bound and allow lowering K when a big drop
+                    is detected. If no limit provided, choose K automatically.
     """
     P = pal_rgb_full.shape[0]
 
-    if colours == "full":
+    # Full palette
+    if colours_mode == "full":
         sel = np.arange(P, dtype=np.int32)
         return (
             pal_rgb_full[sel],
@@ -146,7 +164,8 @@ def restrict_palette(
             sel,
         )
 
-    if colours == "bw":
+    # Black & white (neutrals)
+    if colours_mode == "bw":
         mask = pal_lch_full[:, 1] <= NEUTRAL_C_MAX
         idx = np.where(mask)[0]
         if idx.size == 0:
@@ -155,7 +174,11 @@ def restrict_palette(
             idx = np.unique(np.array([lo, hi], dtype=np.int32))
         sel = idx.astype(np.int32, copy=False)
         if debug:
-            print(f"[debug] colours=bw  neutrals={sel.size}", flush=True)
+            debug_log(
+                key_value_pairs_to_string(
+                    [("Palette", "neutrals only"), ("Neutrals", sel.size)]
+                )
+            )
         return (
             pal_rgb_full[sel],
             pal_lab_full[sel].astype(np.float32, copy=False),
@@ -163,7 +186,8 @@ def restrict_palette(
             sel,
         )
 
-    uniq_rgb, uniq_counts = unique_visible(img_rgb, alpha)
+    # Limited palette (top-K by usage)
+    uniq_rgb, uniq_counts = unique_visible_rgb(img_rgb, alpha)
     if uniq_rgb.shape[0] == 0:
         lo = int(np.argmin(pal_lch_full[:, 0]))
         hi = int(np.argmax(pal_lch_full[:, 0]))
@@ -176,21 +200,33 @@ def restrict_palette(
         )
 
     src_lab = rgb_to_lab(uniq_rgb.astype(np.float32))
-    nearest = nearest_palette_indices_lab(src_lab, pal_lab_full)  # (U,)
+    nearest = nearest_palette_indices_lab_distance(src_lab, pal_lab_full)  # (U,)
     counts_per_palette = np.bincount(
         nearest, weights=uniq_counts.astype(np.float64), minlength=P
     )
 
     k_auto = _auto_k_from_hist(counts_per_palette)
     if debug:
-        print(f"[debug] limited: k_auto={k_auto}", flush=True)
+        debug_log(
+            key_value_pairs_to_string(
+                [("Palette", "limited (top-K)"), ("Auto K", k_auto)]
+            )
+        )
 
     if limit_opt is not None:
         k_final = min(int(limit_opt), k_auto)
-        if debug and k_final != limit_opt:
-            print(
-                f"[debug] limited: user limit={limit_opt} -> using {k_final} due to big drop",
-                flush=True,
+        if debug:
+            debug_log(
+                key_value_pairs_to_string(
+                    [
+                        ("User limit", int(limit_opt)),
+                        ("Using K", int(k_final)),
+                        (
+                            "Reason",
+                            "big drop" if k_final != int(limit_opt) else "user cap",
+                        ),
+                    ]
+                )
             )
     else:
         k_final = k_auto
@@ -201,14 +237,16 @@ def restrict_palette(
         order = np.argsort(counts_per_palette)[::-1]
         top = order[: min(12, order.size)]
         total = counts_per_palette.sum() or 1.0
-        print(f"[debug] limited: selected K={sel.size}", flush=True)
+        debug_log(key_value_pairs_to_string([("Selected K", int(sel.size))]))
+        debug_log("Top palette by estimated usage:")
+        sel_set = set(sel.tolist())
         for j in top:
             rgb = pal_rgb_full[j]
             hhex = f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
             share = counts_per_palette[j] / total
             nm = name_of.get(hhex, "?")
-            flag = "*" if j in sel.tolist() else " "
-            print(f"  {flag} {hhex}  {nm}: share={share:.1%}", flush=True)
+            mark = "*" if j in sel_set else " "
+            debug_log(f"  {mark} {hhex}  {nm}: share={share:.1%}")
 
     return (
         pal_rgb_full[sel],

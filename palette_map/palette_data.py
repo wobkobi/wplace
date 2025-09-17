@@ -6,7 +6,7 @@ Palette definitions and builders.
 
 Exports:
   PALETTE: list[tuple[str, str]]  # [(hex, name), ...]
-  build_palette(hex_name_pairs=PALETTE)
+  construct_palette(hex_name_pairs=PALETTE)
     -> (items: list[PaletteItem],
         name_of: dict[RGBTuple, str],
         pal_lab: Lab,
@@ -21,6 +21,7 @@ from .core_types import PaletteItem, Lab, Lch, RGBTuple, hex_to_rgb
 from .colour_convert import rgb_to_lab, lab_to_lch
 
 
+# Keep spellings in this array exactly as provided (incl. "Gray").
 PALETTE: List[Tuple[str, str]] = [
     ("#ed1c24", "Red"),
     ("#d18078", "Peach"),
@@ -88,20 +89,22 @@ PALETTE: List[Tuple[str, str]] = [
 ]
 
 
-def build_palette(
+def construct_palette(
     hex_name_pairs: List[Tuple[str, str]] = PALETTE,
 ) -> Tuple[List[PaletteItem], Dict[RGBTuple, str], Lab, Lch]:
     """
-    Convert a list of (hex, name) into:
+    Convert a list of (hex, name) pairs into:
       items: list[PaletteItem] with rgb, name, lab, lch
       name_of: dict mapping RGBTuple -> name
       pal_lab: float32 array [P,3]
       pal_lch: float32 array [P,3]
     """
-    rgbs_u8 = np.array([hex_to_rgb(hx) for hx, _ in hex_name_pairs], dtype=np.uint8)
+    palette_rgb_u8 = np.array(
+        [hex_to_rgb(hx) for hx, _ in hex_name_pairs], dtype=np.uint8
+    )
 
     pal_lab: Lab = (
-        rgb_to_lab(rgbs_u8.astype(np.float32))
+        rgb_to_lab(palette_rgb_u8.astype(np.float32))
         .reshape(-1, 3)
         .astype(np.float32, copy=False)
     )
@@ -110,23 +113,23 @@ def build_palette(
     items: List[PaletteItem] = []
     name_of: Dict[RGBTuple, str] = {}
 
-    for i, (_hx, name) in enumerate(hex_name_pairs):
+    for i, (_hex_str, colour_name) in enumerate(hex_name_pairs):
         rgb_tuple: RGBTuple = (
-            int(rgbs_u8[i, 0]),
-            int(rgbs_u8[i, 1]),
-            int(rgbs_u8[i, 2]),
+            int(palette_rgb_u8[i, 0]),
+            int(palette_rgb_u8[i, 1]),
+            int(palette_rgb_u8[i, 2]),
         )
         items.append(
             PaletteItem(
                 rgb=rgb_tuple,
-                name=name,
+                name=colour_name,
                 lab=pal_lab[i].copy(),
                 lch=pal_lch[i].copy(),
             )
         )
-        name_of[rgb_tuple] = name
+        name_of[rgb_tuple] = colour_name
 
     return items, name_of, pal_lab, pal_lch
 
 
-__all__ = ["PALETTE", "build_palette"]
+__all__ = ["PALETTE", "construct_palette"]
