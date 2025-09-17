@@ -1,3 +1,4 @@
+# palette_map/core_types.py
 from __future__ import annotations
 
 """

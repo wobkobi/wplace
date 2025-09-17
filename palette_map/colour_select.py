@@ -1,3 +1,4 @@
+# palette_map/colour_select.py
 from __future__ import annotations
 
 """
